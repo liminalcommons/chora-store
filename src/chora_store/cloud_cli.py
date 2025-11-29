@@ -2,6 +2,7 @@
 Cloud CLI - Simple invite/join commands for cloud sync.
 
 Usage:
+    cloud-setup: Configure your account (choose username/password)
     cloud-invite: Create workspace and generate invite link
     cloud-join <invite>: Join a workspace from invite link
 """
@@ -11,9 +12,13 @@ import sys
 import json
 import base64
 import secrets
+import getpass
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+
+
+DEFAULT_SERVER = "https://chora-cloud.accounts-82f.workers.dev"
 
 
 # Config file location
@@ -38,7 +43,10 @@ def save_config(config: dict) -> None:
 
 def api_request(url: str, method: str = "GET", data: dict = None, token: str = None) -> dict:
     """Make API request to cloud server."""
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "chora-sync/1.0",
+    }
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
@@ -67,7 +75,7 @@ def create_invite() -> str:
     server = config.get("server")
     if not server:
         # Default to the deployed instance
-        server = os.environ.get("CHORA_CLOUD_URL", "https://chora-cloud.accounts-82f.workers.dev")
+        server = os.environ.get("CHORA_CLOUD_URL", DEFAULT_SERVER)
 
     print(f"  Using server: {server}")
 
