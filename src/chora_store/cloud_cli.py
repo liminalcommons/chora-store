@@ -243,12 +243,239 @@ def show_status() -> None:
     print(f"  Key: {'set' if config.get('workspace_key') else 'not set'}")
 
 
+def get_sync_version() -> int:
+    """Get the last synced version from local config."""
+    config = load_config()
+    return config.get("sync_version", 0)
+
+
+def set_sync_version(version: int) -> None:
+    """Save the last synced version."""
+    config = load_config()
+    config["sync_version"] = version
+    save_config(config)
+
+
+def is_configured() -> bool:
+    """Check if cloud sync is configured."""
+    config = load_config()
+    return bool(config.get("server") and config.get("workspace_id") and config.get("token"))
+
+
+def ensure_token() -> str:
+    """Ensure we have a valid token, re-authenticating if needed."""
+    config = load_config()
+    token = config.get("token")
+
+    if not token:
+        # Try to re-auth with saved credentials
+        email = config.get("email")
+        password = config.get("password")
+        server = config.get("server")
+
+        if email and password and server:
+            result = api_request(f"{server}/api/login", "POST", {
+                "email": email,
+                "password": password
+            })
+            token = result["data"]["token"]
+            config["token"] = token
+            save_config(config)
+
+    return token
+
+
+def push_entity(entity_dict: dict) -> bool:
+    """
+    Push a single entity to the cloud.
+
+    Called automatically when entities are created/updated.
+    Returns True if successful, False otherwise.
+    """
+    if not is_configured():
+        return False
+
+    config = load_config()
+    server = config.get("server")
+    workspace_id = config.get("workspace_id")
+
+    try:
+        token = ensure_token()
+        if not token:
+            return False
+
+        # Push to sync endpoint
+        api_request(
+            f"{server}/sync/{workspace_id}/changes",
+            "POST",
+            [{
+                "entityId": entity_dict["id"],
+                "changeType": "upsert",
+                "data": json.dumps(entity_dict),
+                "timestamp": entity_dict.get("updated_at", entity_dict.get("created_at")),
+            }],
+            token
+        )
+        return True
+    except Exception as e:
+        # Silently fail - sync is best-effort
+        # Could log to debug file if needed
+        return False
+
+
+def pull_entities() -> list:
+    """
+    Pull entities from the cloud.
+
+    Called on orient/startup to get remote changes.
+    Returns list of entity dicts, or empty list if not configured/error.
+    """
+    if not is_configured():
+        return []
+
+    config = load_config()
+    server = config.get("server")
+    workspace_id = config.get("workspace_id")
+    since_version = get_sync_version()
+
+    try:
+        token = ensure_token()
+        if not token:
+            return []
+
+        # Pull from sync endpoint
+        result = api_request(
+            f"{server}/sync/{workspace_id}/changes?since={since_version}",
+            "GET",
+            None,
+            token
+        )
+
+        changes = result.get("data", {}).get("changes", [])
+        new_version = result.get("data", {}).get("version", since_version)
+
+        # Update sync version
+        if new_version > since_version:
+            set_sync_version(new_version)
+
+        # Parse entity data
+        entities = []
+        for change in changes:
+            try:
+                data = change.get("data")
+                if data:
+                    entity_dict = json.loads(data) if isinstance(data, str) else data
+                    entities.append(entity_dict)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return entities
+    except Exception:
+        # Silently fail - sync is best-effort
+        return []
+
+
+def sync_all() -> dict:
+    """
+    Full bidirectional sync.
+
+    Returns dict with push_count, pull_count, errors.
+    """
+    from .repository import EntityRepository
+
+    if not is_configured():
+        return {"error": "Not configured. Run: just cloud-invite or just cloud-join"}
+
+    config = load_config()
+    server = config.get("server")
+    workspace_id = config.get("workspace_id")
+    since_version = get_sync_version()
+
+    result = {
+        "pushed": 0,
+        "pulled": 0,
+        "errors": [],
+    }
+
+    try:
+        token = ensure_token()
+        if not token:
+            result["errors"].append("Authentication failed")
+            return result
+
+        repo = EntityRepository()
+
+        # Push local changes
+        local_changes = repo.get_changes_since(since_version)
+        for entity, change_type in local_changes:
+            try:
+                api_request(
+                    f"{server}/sync/{workspace_id}/changes",
+                    "POST",
+                    [{
+                        "entityId": entity.id,
+                        "changeType": change_type,
+                        "data": json.dumps(entity.to_dict()),
+                        "timestamp": entity.updated_at.isoformat(),
+                        "version": entity.version,
+                    }],
+                    token
+                )
+                result["pushed"] += 1
+            except Exception as e:
+                result["errors"].append(f"Push {entity.id}: {e}")
+
+        # Pull remote changes
+        try:
+            pull_result = api_request(
+                f"{server}/sync/{workspace_id}/changes?since={since_version}",
+                "GET",
+                None,
+                token
+            )
+
+            changes = pull_result.get("data", {}).get("changes", [])
+            new_version = pull_result.get("data", {}).get("version", since_version)
+
+            for change in changes:
+                try:
+                    data = change.get("data")
+                    if data:
+                        entity_dict = json.loads(data) if isinstance(data, str) else data
+                        # Merge into local (upsert)
+                        from .models import Entity
+                        entity = Entity.from_dict(entity_dict)
+                        existing = repo.read(entity.id)
+                        if existing:
+                            # Only update if remote is newer
+                            if entity.version > existing.version:
+                                repo.update(entity)
+                                result["pulled"] += 1
+                        else:
+                            repo.create(entity)
+                            result["pulled"] += 1
+                except Exception as e:
+                    result["errors"].append(f"Pull merge: {e}")
+
+            # Update sync version
+            set_sync_version(new_version)
+
+        except Exception as e:
+            result["errors"].append(f"Pull: {e}")
+
+    except Exception as e:
+        result["errors"].append(str(e))
+
+    return result
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage:")
         print("  python -m chora_store.cloud_cli invite  - Create and share workspace")
         print("  python -m chora_store.cloud_cli join <invite-link>")
         print("  python -m chora_store.cloud_cli status")
+        print("  python -m chora_store.cloud_cli sync    - Full bidirectional sync")
         sys.exit(1)
 
     command = sys.argv[1]
@@ -287,6 +514,24 @@ def main():
         print("  Cloud Sync Status:")
         print("")
         show_status()
+        print("")
+
+    elif command == "sync":
+        print("")
+        print("  Syncing with cloud...")
+        print("")
+        result = sync_all()
+        if result.get("error"):
+            print(f"  Error: {result['error']}")
+        else:
+            print(f"  Pushed: {result['pushed']} entities")
+            print(f"  Pulled: {result['pulled']} entities")
+            if result['errors']:
+                print(f"  Errors: {len(result['errors'])}")
+                for err in result['errors'][:5]:  # Show first 5
+                    print(f"    - {err}")
+            else:
+                print("  Sync complete!")
         print("")
 
     else:

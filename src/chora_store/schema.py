@@ -19,10 +19,10 @@ Even if someone bypasses the EntityFactory, the database rejects invalid data.
 
 VALID_TYPES = ["inquiry", "feature", "task", "learning", "pattern", "release"]
 
-# Valid statuses by type (must match kernel standards/entity.yaml v2.0)
+# Valid statuses by type (must match kernel standards/entity.yaml - Active State Lifecycle)
 VALID_STATUSES = {
     "inquiry": ["active", "held", "resolved", "reified"],
-    "feature": ["design", "prototype", "dogfood", "complete", "abandoned"],
+    "feature": ["intended", "reifying", "converging", "stable", "drifting", "finalizing"],
     "task": ["pending", "active", "complete", "blocked"],
     "learning": ["captured", "validated", "applied"],
     "pattern": ["proposed", "adopted", "deprecated"],

@@ -57,14 +57,14 @@ class TestEntityCreation:
 
         assert entity.id == "feature-voice-canvas"
         assert entity.type == "feature"
-        assert entity.status == "planned"  # Default status
+        assert entity.status == "intended"  # Signal captured, system holds intent
         assert entity.data["name"] == "Voice Canvas"
 
     def test_create_with_custom_status(self, factory):
         """Test creating entity with custom status."""
-        entity = factory.create("feature", "Test Feature", status="in_progress")
+        entity = factory.create("feature", "Test Feature", status="reifying")
 
-        assert entity.status == "in_progress"
+        assert entity.status == "reifying"  # Structure emerging from gas
 
     def test_create_pattern(self, factory):
         """Test creating a pattern entity."""
@@ -159,12 +159,12 @@ class TestEventEmission:
         events = []
         factory.observer.on_change(lambda e: events.append(e))
 
-        factory.update(entity.id, status="in_progress")
+        factory.update(entity.id, status="reifying")
 
         assert len(events) == 1
         assert events[0].change_type == ChangeType.UPDATED
-        assert events[0].old_status == "planned"
-        assert events[0].new_status == "in_progress"
+        assert events[0].old_status == "intended"
+        assert events[0].new_status == "reifying"
 
     def test_delete_emits_event(self, factory):
         """Test that delete emits DELETED event."""
@@ -185,10 +185,10 @@ class TestEntityUpdate:
     def test_update_status(self, factory):
         """Test updating entity status."""
         entity = factory.create("feature", "Status Test")
-        assert entity.status == "planned"
+        assert entity.status == "intended"  # Signal captured
 
-        updated = factory.update(entity.id, status="in_progress")
-        assert updated.status == "in_progress"
+        updated = factory.update(entity.id, status="reifying")
+        assert updated.status == "reifying"  # Structure emerging
 
     def test_update_data(self, factory):
         """Test updating entity data fields."""
@@ -202,7 +202,7 @@ class TestEntityUpdate:
         entity = factory.create("feature", "Version Test")
         assert entity.version == 1
 
-        updated = factory.update(entity.id, status="in_progress")
+        updated = factory.update(entity.id, status="reifying")
         assert updated.version == 2
 
 
@@ -231,15 +231,15 @@ class TestEntityListing:
 
     def test_list_by_status(self, factory):
         """Test listing entities by status."""
-        factory.create("feature", "Status Test 1", status="planned")
-        e2 = factory.create("feature", "Status Test 2", status="planned")
-        factory.update(e2.id, status="in_progress")
+        factory.create("feature", "Status Test 1", status="intended")
+        e2 = factory.create("feature", "Status Test 2", status="intended")
+        factory.update(e2.id, status="reifying")
 
-        planned = factory.list(status="planned")
-        in_progress = factory.list(status="in_progress")
+        intended = factory.list(status="intended")
+        reifying = factory.list(status="reifying")
 
-        assert all(e.status == "planned" for e in planned)
-        assert all(e.status == "in_progress" for e in in_progress)
+        assert all(e.status == "intended" for e in intended)
+        assert all(e.status == "reifying" for e in reifying)
 
 
 class TestPhysicsEngine:

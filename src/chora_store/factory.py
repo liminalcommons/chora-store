@@ -151,6 +151,9 @@ class EntityFactory:
         # 9. Emit stigmergic signal
         self.observer.emit(ChangeType.CREATED, entity)
 
+        # 10. Cloud sync (best-effort, silent failure)
+        self._sync_push(entity)
+
         return entity
 
     def update(
@@ -203,6 +206,9 @@ class EntityFactory:
 
         # 5. Emit stigmergic signal
         self.observer.emit(ChangeType.UPDATED, entity, old_status=old_status)
+
+        # 6. Cloud sync (best-effort, silent failure)
+        self._sync_push(entity)
 
         return entity
 
@@ -317,3 +323,17 @@ class EntityFactory:
         if entity_type not in self.schema.get("types", {}):
             raise InvalidEntityType(f"Unknown entity type: {entity_type}")
         return self.schema["types"][entity_type].get("statuses", [])
+
+    def _sync_push(self, entity: Entity) -> None:
+        """
+        Push entity to cloud (best-effort, silent failure).
+
+        This is stigmergic - we leave a mark in the cloud for other agents.
+        """
+        try:
+            from .cloud_cli import push_entity, is_configured
+            if is_configured():
+                push_entity(entity.to_dict())
+        except Exception:
+            # Silent failure - sync is best-effort
+            pass

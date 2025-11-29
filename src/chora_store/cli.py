@@ -22,10 +22,10 @@ def get_workspace_context(repo):
     for e in all_entities:
         counts[e.type] = counts.get(e.type, 0) + 1
 
-        # Track active work
+        # Track active work (using Active State Lifecycle language)
         if e.type == 'inquiry' and e.status == 'active':
             active_inquiries.append({'id': e.id, 'status': e.status})
-        elif e.type == 'feature' and e.status in ('design', 'prototype', 'dogfood'):
+        elif e.type == 'feature' and e.status in ('intended', 'reifying', 'converging'):
             active_features.append({'id': e.id, 'status': e.status})
         elif e.type == 'task' and e.status == 'active':
             active_tasks.append({'id': e.id, 'status': e.status})
@@ -64,7 +64,35 @@ def get_workspace_context(repo):
 def orient():
     """Show current workspace state."""
     repo = EntityRepository()
+
+    # Pull remote changes first (best-effort, silent failure)
+    sync_status = None
+    pulled_count = 0
+    try:
+        from .cloud_cli import is_configured, pull_entities
+        if is_configured():
+            sync_status = "connected"
+            remote_entities = pull_entities()
+            for entity_dict in remote_entities:
+                try:
+                    from .models import Entity
+                    entity = Entity.from_dict(entity_dict)
+                    existing = repo.read(entity.id)
+                    if existing:
+                        if entity.version > existing.version:
+                            repo.update(entity)
+                            pulled_count += 1
+                    else:
+                        repo.create(entity)
+                        pulled_count += 1
+                except Exception:
+                    pass  # Skip problematic entities
+    except Exception:
+        sync_status = "error"
+
     ctx = get_workspace_context(repo)
+    ctx['sync_status'] = sync_status
+    ctx['pulled_count'] = pulled_count
 
     print("")
     print("  ╭──────────────────────────────────────────────────────────╮")
@@ -119,6 +147,20 @@ def orient():
         print("  Entities:")
         for t, c in sorted(counts.items()):
             print(f"    {t}: {c}")
+        print("")
+
+    # Sync status
+    sync_status = ctx.get('sync_status')
+    pulled = ctx.get('pulled_count', 0)
+    if sync_status == "connected":
+        sync_icon = "☁️"
+        if pulled > 0:
+            print(f"  {sync_icon} Cloud: synced ({pulled} pulled)")
+        else:
+            print(f"  {sync_icon} Cloud: connected")
+        print("")
+    elif sync_status == "error":
+        print("  ⚠ Cloud: sync error")
         print("")
 
     print("  ─────────────────────────────────────────────────────────")
