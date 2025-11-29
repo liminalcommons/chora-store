@@ -1,0 +1,19 @@
+# Litestream Configuration for Local Development
+#
+# This config backs up to the local filesystem for testing/development.
+# No cloud credentials required.
+#
+# Start: litestream replicate -config litestream-local.yml
+# Restore: litestream restore -config litestream-local.yml ~/.chora/chora.db
+
+dbs:
+  - path: ~/.chora/chora.db
+    replicas:
+      - type: file
+        path: ~/.chora/backups
+        # Sync every second for local dev (fast feedback)
+        sync-interval: 1s
+        # Snapshot every 5 minutes
+        snapshot-interval: 5m
+        # Keep 1 hour of WAL files
+        retention: 1h
