@@ -6,27 +6,29 @@ Even if someone bypasses the EntityFactory, the database rejects invalid data.
 """
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STANDARD MODEL - 6 Entity Types (matches chora-kernel/standards/entity.yaml v2.0)
+# STANDARD MODEL - 7 Entity Types (matches chora-kernel/standards/entity.yaml v2.1)
 # ═══════════════════════════════════════════════════════════════════════════════
-# The 6 Nouns (Statics) of the Development Universe:
+# The 7 Nouns (Statics) of the Development Universe:
 #   - Inquiry   (Gas)       Potential energy, holds the question
 #   - Feature   (Solid)     Structure, holds the plan
 #   - Task      (Liquid)    Kinetic energy, holds the action
 #   - Learning  (Radiation) Feedback, holds the history
 #   - Pattern   (Crystal)   Law, holds the wisdom
 #   - Release   (Clock)     Time, holds the sync point
+#   - Tool      (Field)     Affordance, holds the capability
 # ═══════════════════════════════════════════════════════════════════════════════
 
-VALID_TYPES = ["inquiry", "feature", "task", "learning", "pattern", "release"]
+VALID_TYPES = ["inquiry", "feature", "task", "learning", "pattern", "release", "tool"]
 
-# Valid statuses by type (must match kernel standards/entity.yaml - Active State Lifecycle)
+# Valid statuses by type (must match kernel standards/entity.yaml - Production/Linkage Model v2.1)
 VALID_STATUSES = {
     "inquiry": ["active", "held", "resolved", "reified"],
-    "feature": ["intended", "reifying", "converging", "stable", "drifting", "finalizing"],
+    "feature": ["nascent", "converging", "stable", "drifting", "finalizing"],
     "task": ["pending", "active", "complete", "blocked"],
     "learning": ["captured", "validated", "applied"],
-    "pattern": ["proposed", "adopted", "deprecated"],
+    "pattern": ["proposed", "experimental", "adopted", "deprecated"],
     "release": ["planned", "released", "deprecated"],
+    "tool": ["proposed", "active", "deprecated"],
 }
 
 # Flatten all valid statuses for CHECK constraint

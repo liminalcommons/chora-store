@@ -6,18 +6,25 @@ Invalid states cannot exist because the factory won't create them.
 
 The factory:
 1. Loads the kernel schema (entity.yaml)
-2. Validates all entity creation requests
-3. Generates semantic IDs
-4. Applies templates
-5. Persists via repository
-6. Emits stigmergic signals via observer
+2. Loads experimental patterns (epigenetic mutations)
+3. Validates all entity creation requests against effective schema
+4. Generates semantic IDs
+5. Applies templates
+6. Persists via repository
+7. Emits stigmergic signals via observer
+
+EPIGENETIC BRIDGE:
+The factory now supports "epigenetic" patterns - schema extensions that can be
+tested on new entities without modifying the kernel permanently. Patterns with
+subtype='schema-extension' and status='experimental' are merged into the
+effective schema at runtime.
 """
 
 import re
 import yaml
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .models import Entity, ValidationError, InvalidEntityType
 from .repository import EntityRepository
@@ -64,6 +71,109 @@ class EntityFactory:
         with open(schema_path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # EPIGENETIC BRIDGE - Dynamic Schema Extension
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _load_experimental_patterns(self, target_type: str) -> List[Entity]:
+        """
+        Load experimental schema-extension patterns for a given entity type.
+
+        These patterns represent "epigenetic" mutations - proposed schema changes
+        that are being tested on new entities without modifying the kernel.
+
+        Args:
+            target_type: The entity type to find patterns for
+
+        Returns:
+            List of Pattern entities with matching mechanics.target
+        """
+        patterns = []
+        try:
+            # Query for experimental schema-extension patterns
+            all_patterns = self.repository.list(entity_type="pattern", limit=100)
+            for p in all_patterns:
+                # Check if it's a schema-extension pattern
+                subtype = p.data.get("subtype")
+                if subtype != "schema-extension":
+                    continue
+                # Check if it's experimental
+                if p.status != "experimental":
+                    continue
+                # Check if it targets this entity type
+                mechanics = p.data.get("mechanics", {})
+                if mechanics.get("target") == target_type:
+                    patterns.append(p)
+        except Exception:
+            # If repository isn't ready yet, return empty list
+            pass
+        return patterns
+
+    def _get_effective_schema(self, entity_type: str) -> tuple:
+        """
+        Get the effective schema for an entity type, including epigenetic extensions.
+
+        This merges inject_fields from experimental patterns into the base schema.
+
+        Args:
+            entity_type: Type of entity
+
+        Returns:
+            Tuple of (type_schema dict, list of applied pattern IDs)
+        """
+        # Start with base schema from kernel
+        type_schema = dict(self.schema["types"][entity_type])
+
+        # Track which patterns are applied
+        applied_patterns = []
+
+        # Load and merge experimental patterns
+        patterns = self._load_experimental_patterns(entity_type)
+        for pattern in patterns:
+            mechanics = pattern.data.get("mechanics", {})
+            inject_fields = mechanics.get("inject_fields", {})
+
+            # Merge injected fields into additional_optional
+            if inject_fields:
+                current_optional = type_schema.get("additional_optional", [])
+                if isinstance(current_optional, list):
+                    # Add field names to optional list
+                    for field_name in inject_fields.keys():
+                        if field_name not in current_optional:
+                            current_optional.append(field_name)
+                    type_schema["additional_optional"] = current_optional
+
+                # Store field definitions for validation
+                if "_epigenetic_fields" not in type_schema:
+                    type_schema["_epigenetic_fields"] = {}
+                type_schema["_epigenetic_fields"].update(inject_fields)
+
+                applied_patterns.append(pattern.id)
+
+        return type_schema, applied_patterns
+
+    def _apply_epigenetic_defaults(
+        self, entity_type: str, data: Dict[str, Any], type_schema: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Apply default values from epigenetic fields.
+
+        Args:
+            entity_type: Type of entity
+            data: Current data dict
+            type_schema: Effective schema with _epigenetic_fields
+
+        Returns:
+            Updated data dict with defaults applied
+        """
+        epigenetic_fields = type_schema.get("_epigenetic_fields", {})
+        for field_name, field_def in epigenetic_fields.items():
+            if field_name not in data:
+                default = field_def.get("default")
+                if default is not None:
+                    data[field_name] = default
+        return data
+
     def create(
         self,
         entity_type: str,
@@ -96,18 +206,19 @@ class EntityFactory:
                 f"Valid types: {list(self.schema.get('types', {}).keys())}"
             )
 
-        type_schema = self.schema["types"][entity_type]
+        # 2. Get effective schema (base + epigenetic extensions)
+        type_schema, applied_patterns = self._get_effective_schema(entity_type)
 
-        # 2. Generate semantic ID
+        # 3. Generate semantic ID
         slug = self._slugify(title)
         entity_id = f"{entity_type}-{slug}"
 
-        # 3. Validate ID doesn't already exist
+        # 4. Validate ID doesn't already exist
         existing = self.repository.read(entity_id)
         if existing:
             raise ValidationError(f"Entity '{entity_id}' already exists")
 
-        # 4. Determine status
+        # 5. Determine status
         valid_statuses = type_schema.get("statuses", [])
         if status is None:
             status = valid_statuses[0] if valid_statuses else "active"
@@ -117,7 +228,7 @@ class EntityFactory:
                 f"Valid statuses: {valid_statuses}"
             )
 
-        # 5. Build data dict
+        # 6. Build data dict
         now = datetime.utcnow()
         data = {
             "name": title,
@@ -127,7 +238,14 @@ class EntityFactory:
             **kwargs,
         }
 
-        # 6. Validate required fields
+        # 7. Apply epigenetic defaults (from experimental patterns)
+        data = self._apply_epigenetic_defaults(entity_type, data, type_schema)
+
+        # 8. Tag entity with applied epigenetic patterns (for tracking)
+        if applied_patterns:
+            data["_epigenetics"] = applied_patterns
+
+        # 9. Validate required fields
         required = type_schema.get("additional_required", [])
         for field in required:
             if field not in data or not data[field]:
@@ -135,7 +253,7 @@ class EntityFactory:
                     f"Missing required field '{field}' for {entity_type}"
                 )
 
-        # 7. Create entity (valid by construction)
+        # 10. Create entity (valid by construction)
         entity = Entity(
             id=entity_id,
             type=entity_type,
@@ -145,13 +263,13 @@ class EntityFactory:
             updated_at=now,
         )
 
-        # 8. Persist via repository
+        # 11. Persist via repository
         entity = self.repository.create(entity)
 
-        # 9. Emit stigmergic signal
+        # 12. Emit stigmergic signal
         self.observer.emit(ChangeType.CREATED, entity)
 
-        # 10. Cloud sync (best-effort, silent failure)
+        # 13. Cloud sync (best-effort, silent failure)
         self._sync_push(entity)
 
         return entity
@@ -192,6 +310,9 @@ class EntityFactory:
                     f"Invalid status '{status}' for {entity.type}. "
                     f"Valid statuses: {valid_statuses}"
                 )
+            # 2b. Validate transition is allowed
+            if status != old_status:
+                self._validate_transition(entity.type, old_status, status)
             entity = entity.copy(status=status)
 
         # 3. Update data fields
@@ -313,6 +434,46 @@ class EntityFactory:
             )
 
         return slug
+
+    def _validate_transition(
+        self, entity_type: str, from_status: str, to_status: str
+    ) -> None:
+        """
+        Validate that a status transition is allowed.
+
+        The kernel defines invalid transitions. Anything not explicitly
+        invalid is permitted. This is the physics enforcement point.
+
+        Args:
+            entity_type: Type of entity
+            from_status: Current status
+            to_status: Desired new status
+
+        Raises:
+            ValidationError: If transition is invalid
+        """
+        transitions = self.schema.get("transitions", {})
+        type_transitions = transitions.get(entity_type, {})
+        invalid_edges = type_transitions.get("invalid", [])
+
+        for edge in invalid_edges:
+            edge_from = edge.get("from")
+            edge_to = edge.get("to")
+
+            # Check if this transition matches an invalid edge
+            if edge_from == from_status:
+                # Wildcard: from this status, cannot go anywhere
+                if edge_to == "*":
+                    raise ValidationError(
+                        f"Invalid transition: {entity_type} cannot leave "
+                        f"'{from_status}' state. {edge.get('reason', '')}"
+                    )
+                # Specific: from this status, cannot go to that status
+                if edge_to == to_status:
+                    raise ValidationError(
+                        f"Invalid transition: {entity_type} cannot go from "
+                        f"'{from_status}' to '{to_status}'. {edge.get('reason', '')}"
+                    )
 
     def get_valid_types(self) -> list:
         """Get list of valid entity types."""
