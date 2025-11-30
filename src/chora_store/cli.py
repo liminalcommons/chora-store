@@ -7,10 +7,15 @@ These are extracted from justfile heredocs for cross-platform compatibility.
 import sys
 from .factory import EntityFactory
 from .repository import EntityRepository
+from .vitality import VitalitySensor
 
 
 def get_workspace_context(repo):
-    """Get workspace context for orientation."""
+    """Get workspace context for orientation using vitality sensing."""
+    # Use vitality sensor for real metrics
+    sensor = VitalitySensor(repo)
+    vitality = sensor.summary()
+
     # Count entities by type
     all_entities = repo.list(limit=1000)
     counts = {}
@@ -18,21 +23,106 @@ def get_workspace_context(repo):
     active_features = []
     active_tasks = []
     blocked = []
+    sample_learnings = []  # Sample of undigested learnings for semantic surface
+    recent_work = []  # Recently touched work items for session continuity
 
     for e in all_entities:
         counts[e.type] = counts.get(e.type, 0) + 1
 
         # Track active work (using Active State Lifecycle language)
+        # Include semantic data for agent cognition, not just IDs
         if e.type == 'inquiry' and e.status == 'active':
-            active_inquiries.append({'id': e.id, 'status': e.status})
-        elif e.type == 'feature' and e.status in ('intended', 'reifying', 'converging'):
-            active_features.append({'id': e.id, 'status': e.status})
+            core_concern = e.data.get('core_concern', '')
+            # Handle dict format (legacy) - extract statement if present
+            if isinstance(core_concern, dict):
+                core_concern = core_concern.get('statement', str(core_concern))
+            if not isinstance(core_concern, str):
+                core_concern = str(core_concern)
+            active_inquiries.append({
+                'id': e.id,
+                'status': e.status,
+                'core_concern': core_concern[:60] + '...' if len(core_concern) > 60 else core_concern
+            })
+        elif e.type == 'feature' and e.status in ('nascent', 'converging'):
+            name = e.data.get('name', '')
+            active_features.append({
+                'id': e.id,
+                'status': e.status,
+                'name': name
+            })
         elif e.type == 'task' and e.status == 'active':
-            active_tasks.append({'id': e.id, 'status': e.status})
+            name = e.data.get('name', '')
+            active_tasks.append({
+                'id': e.id,
+                'status': e.status,
+                'name': name
+            })
 
         # Track blocked
         if e.status == 'blocked':
             blocked.append({'id': e.id})
+
+        # Sample undigested learnings (captured = not yet validated/applied)
+        if e.type == 'learning' and e.status == 'captured' and len(sample_learnings) < 5:
+            insight = e.data.get('insight', '')
+            if isinstance(insight, str) and insight:
+                # Clean up: single line, truncated
+                insight_clean = ' '.join(insight.split())[:80]
+                if len(insight) > 80:
+                    insight_clean += '...'
+                sample_learnings.append({
+                    'id': e.id,
+                    'insight': insight_clean
+                })
+
+    # Recent work for session continuity (last 3 modified work items)
+    work_types = {'inquiry', 'feature', 'task', 'learning'}
+    work_items = [e for e in all_entities if e.type in work_types]
+    work_items.sort(key=lambda x: x.updated_at or '', reverse=True)
+    for e in work_items[:3]:
+        name = e.data.get('name', '') or e.data.get('core_concern', '') or e.data.get('insight', '')
+        if isinstance(name, dict):
+            name = name.get('statement', str(name))
+        if not isinstance(name, str):
+            name = str(name)
+        name_clean = ' '.join(name.split())[:50]
+        if len(name) > 50:
+            name_clean += '...'
+        recent_work.append({
+            'id': e.id,
+            'type': e.type,
+            'name': name_clean,
+            'updated': e.updated_at
+        })
+
+    # Current focus - the most recently touched active inquiry (narrative thread)
+    # This bridges the session context gap - shows what the agent was working on
+    current_focus = None
+    active_inquiry_entities = [e for e in all_entities if e.type == 'inquiry' and e.status == 'active']
+    if active_inquiry_entities:
+        # Find the most recently updated active inquiry
+        active_inquiry_entities.sort(key=lambda x: x.updated_at or '', reverse=True)
+        focus_inquiry = active_inquiry_entities[0]
+
+        # Extract rich context for the narrative thread
+        core_concern = focus_inquiry.data.get('core_concern', '')
+        if isinstance(core_concern, dict):
+            core_concern = core_concern.get('statement', str(core_concern))
+        if not isinstance(core_concern, str):
+            core_concern = str(core_concern)
+
+        terrain = focus_inquiry.data.get('terrain', {})
+        adjacent = terrain.get('adjacent_concerns', []) if isinstance(terrain, dict) else []
+        unknowns = terrain.get('unknowns', []) if isinstance(terrain, dict) else []
+
+        current_focus = {
+            'id': focus_inquiry.id,
+            'name': focus_inquiry.data.get('name', ''),
+            'core_concern': core_concern,
+            'adjacent_concerns': adjacent[:3] if isinstance(adjacent, list) else [],
+            'unknowns': unknowns[:3] if isinstance(unknowns, list) else [],
+            'updated': focus_inquiry.updated_at
+        }
 
     # Determine phase
     if active_inquiries:
@@ -44,20 +134,19 @@ def get_workspace_context(repo):
     else:
         phase = {'name': 'idle', 'description': 'No active work', 'suggestion': 'Start with: just inquire "Your idea"'}
 
-    # Determine season
-    total = len(all_entities)
-    season = 'construction' if total < 50 else 'harvest'
-    integrity = 1.0 if total > 0 else 0.0
-
     return {
-        'season': season,
-        'integrity_score': integrity,
+        'season': vitality['season'],
+        'integrity_score': vitality['integrity_score'],
         'phase': phase,
         'active_inquiries': active_inquiries,
         'active_features': active_features,
         'active_tasks': active_tasks,
         'blocked': blocked,
         'counts': counts,
+        'vitality': vitality,
+        'sample_learnings': sample_learnings,
+        'recent_work': recent_work,
+        'current_focus': current_focus,
     }
 
 
@@ -96,15 +185,126 @@ def orient():
 
     print("")
     print("  ╭──────────────────────────────────────────────────────────╮")
-    print("  │  ORIENT · Situational Awareness                          │")
+    print("  │  ORIENT · Vitality Sensing                               │")
     print("  ╰──────────────────────────────────────────────────────────╯")
     print("")
 
-    # Season and integrity
+    # Season and integrity (now real metrics)
     season = ctx.get('season', 'unknown')
     integrity = ctx.get('integrity_score', 0)
-    season_emoji = "🌱" if season == "construction" else "🍂"
-    print(f"  Season: {season_emoji} {season.title()} (integrity: {integrity:.0%})")
+    season_emoji = "🌱" if season == "construction" else "🔧"
+    print(f"  Season: {season_emoji} {season.title()}")
+    print(f"  Integrity: {integrity:.0%}")
+
+    # Current Focus - the narrative thread for session continuity
+    # This shows the agent what it was working on, with full context
+    current_focus = ctx.get('current_focus')
+    if current_focus:
+        print("")
+        print("  ┌─ Current Focus ─────────────────────────────────────────┐")
+        name = current_focus.get('name', '')
+        if name:
+            print(f"  │ 💭 {name}")
+        core = current_focus.get('core_concern', '')
+        if core:
+            # Word wrap long core concerns
+            core_clean = ' '.join(core.split())
+            if len(core_clean) > 55:
+                print(f"  │    \"{core_clean[:55]}\"")
+                print(f"  │    \"{core_clean[55:110]}...\"" if len(core_clean) > 110 else f"  │    \"{core_clean[55:]}\"")
+            else:
+                print(f"  │    \"{core_clean}\"")
+        adjacent = current_focus.get('adjacent_concerns', [])
+        if adjacent:
+            print(f"  │")
+            print(f"  │  Adjacent concerns:")
+            for a in adjacent[:2]:
+                a_clean = ' '.join(str(a).split())[:50]
+                print(f"  │    · {a_clean}")
+        unknowns = current_focus.get('unknowns', [])
+        if unknowns:
+            print(f"  │")
+            print(f"  │  Open questions:")
+            for u in unknowns[:2]:
+                u_clean = ' '.join(str(u).split())[:50]
+                print(f"  │    ? {u_clean}")
+        print(f"  │")
+        print(f"  │  {current_focus.get('id', '')}")
+        print("  └────────────────────────────────────────────────────────┘")
+
+    # Recent work for session continuity
+    recent_work = ctx.get('recent_work', [])
+    if recent_work:
+        print("")
+        print("  Recently Touched:")
+        type_emoji = {'inquiry': '💭', 'feature': '📦', 'task': '⚡', 'learning': '💡'}
+        for r in recent_work:
+            emoji = type_emoji.get(r['type'], '·')
+            print(f"    {emoji} {r['name']}")
+    print("")
+
+    # Vitality metrics
+    vitality = ctx.get('vitality', {})
+    features = vitality.get('features', {})
+    metabolism = vitality.get('metabolism', {})
+
+    if features.get('total', 0) > 0:
+        print(f"  Features: {features.get('stable', 0)} stable, {features.get('drifting', 0)} drifting")
+
+    if metabolism.get('learnings', 0) > 0:
+        undigested = metabolism.get('undigested', 0)
+        if undigested > 0:
+            print(f"  Metabolism: {undigested} undigested learning(s)")
+            # Show sample learnings for semantic access
+            sample_learnings = ctx.get('sample_learnings', [])
+            if sample_learnings:
+                for l in sample_learnings[:3]:
+                    print(f"    • {l['insight']}")
+        else:
+            print(f"  Metabolism: healthy")
+
+    # Experimental patterns fitness (Epigenetic Bridge)
+    try:
+        from .evaluator import PatternEvaluator
+        evaluator = PatternEvaluator(repo)
+        fitness_summary = evaluator.get_summary()
+        if fitness_summary['total_patterns'] > 0:
+            print(f"  Epigenetics: {fitness_summary['total_patterns']} experimental pattern(s)")
+            for p in fitness_summary['patterns'][:3]:
+                status_icon = "🧬" if p['recommendation'] == 'continue' else "✓" if p['recommendation'] == 'promote' else "✗"
+                print(f"    {status_icon} {p['id'].replace('pattern-', '')}: {p['recommendation']} ({p['sample_size']})")
+    except Exception:
+        pass  # Evaluator not available
+
+    # Canary monitoring (bricking detection)
+    try:
+        from .evaluator import CanaryMonitor
+        canary = CanaryMonitor(repo)
+        canary_summary = canary.get_summary()
+        if canary_summary['critical_alerts'] > 0 or canary_summary['warning_alerts'] > 0:
+            health = canary_summary['health']
+            health_icon = "🚨" if health == "critical" else "⚠️"
+            print(f"  Canary: {health_icon} {health.upper()}")
+            for alert in canary_summary['alerts'][:3]:
+                alert_icon = "🚨" if alert['severity'] == "critical" else "⚠️"
+                print(f"    {alert_icon} {alert['pattern_name']}: {alert['signal']}")
+                print(f"       {alert['details']}")
+    except Exception:
+        pass  # Canary not available
+
+    # Pattern induction (learning synthesis)
+    try:
+        from .evaluator import PatternInductor
+        inductor = PatternInductor(repo)
+        induction_summary = inductor.get_summary()
+        if induction_summary['proposals_count'] > 0:
+            print(f"  Induction: {induction_summary['proposals_count']} pattern proposal(s)")
+            for p in induction_summary['proposals'][:3]:
+                conf_pct = int(p['confidence'] * 100)
+                print(f"    💡 {p['name'][:40]} ({conf_pct}% confidence)")
+                print(f"       from {p['source_count']} learnings in {p['domain']}")
+    except Exception:
+        pass  # Inductor not available
     print("")
 
     # Phase
@@ -121,24 +321,52 @@ def orient():
 
     # Active work
     inquiries = ctx.get('active_inquiries', [])
-    features = ctx.get('active_features', [])
+    active_features = ctx.get('active_features', [])
     tasks = ctx.get('active_tasks', [])
     blocked = ctx.get('blocked', [])
 
-    if inquiries or features or tasks:
+    if inquiries or active_features or tasks:
         print("  Active Work:")
         for i in inquiries:
-            print(f"    💭 {i['id']}")
-        for f in features:
-            print(f"    📦 {f['id']} ({f['status']})")
+            # Show core concern for semantic understanding, not just ID
+            concern = i.get('core_concern', '')
+            if concern:
+                print(f"    💭 {concern}")
+                print(f"       └─ {i['id']}")
+            else:
+                print(f"    💭 {i['id']}")
+        for f in active_features:
+            name = f.get('name', '')
+            if name:
+                print(f"    📦 {name} ({f['status']})")
+                print(f"       └─ {f['id']}")
+            else:
+                print(f"    📦 {f['id']} ({f['status']})")
         for t in tasks:
-            print(f"    ⚡ {t['id']}")
+            name = t.get('name', '')
+            if name:
+                print(f"    ⚡ {name}")
+                print(f"       └─ {t['id']}")
+            else:
+                print(f"    ⚡ {t['id']}")
         print("")
 
     if blocked:
         print("  ⚠ Blocked:")
         for b in blocked:
             print(f"    {b['id']}")
+        print("")
+
+    # Attention needed (from vitality sensing)
+    attention = vitality.get('attention', [])
+    stagnant = vitality.get('stagnant', [])
+
+    if attention or stagnant:
+        print("  ⚠ Attention Needed:")
+        for item in attention[:3]:
+            print(f"    • {item}")
+        for s in stagnant[:3]:
+            print(f"    • {s['id']}: {s['reason']}")
         print("")
 
     # Counts
