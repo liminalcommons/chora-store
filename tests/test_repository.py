@@ -29,7 +29,7 @@ def make_entity(id: str = "feature-test", **kwargs) -> Entity:
     """Helper to create test entities."""
     defaults = {
         "type": "feature",
-        "status": "planned",
+        "status": "nascent",  # Default feature status in production/linkage model
         "data": {"name": "Test", "description": "Test entity"},
     }
     defaults.update(kwargs)
@@ -68,10 +68,10 @@ class TestCRUD:
         entity = make_entity()
         created = repo.create(entity)
 
-        updated = created.copy(status="in_progress")
+        updated = created.copy(status="converging")
         result = repo.update(updated)
 
-        assert result.status == "in_progress"
+        assert result.status == "converging"
         assert result.version == 2
 
     def test_update_version_conflict(self, repo):
@@ -80,11 +80,11 @@ class TestCRUD:
         created = repo.create(entity)
 
         # Simulate concurrent update
-        repo.update(created.copy(status="in_progress"))
+        repo.update(created.copy(status="converging"))
 
         # Try to update with old version
         with pytest.raises(ValidationError) as exc:
-            repo.update(created.copy(status="blocked"))
+            repo.update(created.copy(status="stable"))
 
         assert "Version conflict" in str(exc.value)
 
@@ -127,12 +127,12 @@ class TestListing:
 
     def test_list_by_status(self, repo):
         """Test filtering by status."""
-        repo.create(make_entity("feature-test1", status="planned"))
-        repo.create(make_entity("feature-test2", status="in_progress"))
+        repo.create(make_entity("feature-test1", status="nascent"))
+        repo.create(make_entity("feature-test2", status="converging"))
 
-        planned = repo.list(status="planned")
-        assert len(planned) == 1
-        assert planned[0].status == "planned"
+        nascent = repo.list(status="nascent")
+        assert len(nascent) == 1
+        assert nascent[0].status == "nascent"
 
     def test_list_pagination(self, repo):
         """Test pagination."""
@@ -249,7 +249,7 @@ class TestVersionTracking:
         """Test that changes are tracked."""
         entity = make_entity()
         repo.create(entity)
-        repo.update(entity.copy(status="in_progress"))
+        repo.update(entity.copy(status="converging"))
 
         changes = repo.get_changes_since(0)
         assert len(changes) >= 2

@@ -25,12 +25,13 @@ VALID_TYPES = ["inquiry", "feature", "focus", "learning", "pattern", "release", 
 VALID_TIERS = ["data", "workflow", "inference", "agent"]
 
 # Valid statuses by type (must match kernel standards/entity.yaml v3.0)
+# Note: inquiry, feature, learning, pattern support 'subsumed' status for distillation
 VALID_STATUSES = {
-    "inquiry": ["active", "held", "resolved", "reified"],
-    "feature": ["nascent", "converging", "stable", "drifting", "finalizing"],
+    "inquiry": ["active", "held", "resolved", "reified", "subsumed"],
+    "feature": ["nascent", "converging", "stable", "drifting", "finalizing", "subsumed"],
     "focus": ["open", "unlocked", "finalized"],
-    "learning": ["captured", "validated", "applied"],
-    "pattern": ["proposed", "experimental", "adopted", "deprecated"],
+    "learning": ["captured", "validated", "applied", "subsumed"],
+    "pattern": ["proposed", "experimental", "adopted", "deprecated", "subsumed"],
     "release": ["planned", "released", "deprecated"],
     "tool": ["proposed", "active", "deprecated"],
 }
@@ -175,6 +176,7 @@ CREATE TABLE IF NOT EXISTS routes (
     status TEXT NOT NULL DEFAULT 'canary' CHECK (status IN ({', '.join(f"'{s}'" for s in VALID_ROUTE_STATUSES)})),
     source_traces TEXT NOT NULL DEFAULT '[]',
     source_learning_ids TEXT NOT NULL DEFAULT '[]',
+    taught_at_thresholds TEXT NOT NULL DEFAULT '[]',  -- Track hit thresholds where learnings were generated
     created_at TEXT NOT NULL,
     last_hit_at TEXT,
 
@@ -188,6 +190,22 @@ CREATE INDEX IF NOT EXISTS idx_routes_confidence ON routes(confidence);
 CREATE INDEX IF NOT EXISTS idx_routes_hit_count ON routes(hit_count DESC);
 """
 
+# Embeddings table for semantic similarity (distillation/clustering)
+# Stores vector embeddings for entities to enable semantic search and clustering.
+# Separate table allows model versioning and clean migration between embedding models.
+CREATE_EMBEDDINGS_TABLE = """
+CREATE TABLE IF NOT EXISTS embeddings (
+    entity_id TEXT PRIMARY KEY,
+    model_name TEXT NOT NULL,
+    embedding BLOB NOT NULL,
+    embedding_dim INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_embeddings_model ON embeddings(model_name);
+"""
+
 def get_all_schema_sql() -> str:
     """Get all SQL statements to create the schema."""
     return "\n".join([
@@ -198,4 +216,5 @@ def get_all_schema_sql() -> str:
         CREATE_VERSION_TABLE,
         CREATE_TRACES_TABLE,
         CREATE_ROUTES_TABLE,
+        CREATE_EMBEDDINGS_TABLE,
     ])

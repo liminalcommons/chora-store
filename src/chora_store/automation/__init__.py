@@ -1,10 +1,13 @@
 """
 Automation module for chora-store.
 
-Provides file watchers and git hooks for local automation.
+Provides file watchers, git hooks, and cron triggers for local automation.
 """
 
-from .triggers import TriggerRegistry, Action, Trigger
+from .triggers import (
+    TriggerRegistry, Action, Trigger, EventType,
+    get_registry, fire_daily_cron, fire_session_start,
+)
 from .hooks import GitHooks, HookType, HookStatus
 from .watcher import FileWatcher, ChoraWatcher, WatchConfig, FileChange, ChangeType, WatcherStatus, print_status
 
@@ -13,6 +16,10 @@ __all__ = [
     "TriggerRegistry",
     "Action",
     "Trigger",
+    "EventType",
+    "get_registry",
+    "fire_daily_cron",
+    "fire_session_start",
     # Git hooks
     "GitHooks",
     "HookType",

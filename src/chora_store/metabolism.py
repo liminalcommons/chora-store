@@ -28,6 +28,17 @@ from .models import Entity
 from .repository import EntityRepository
 from .schema import VALID_TIERS
 
+# Factory import deferred to avoid circular import
+_factory = None
+
+def _get_factory():
+    """Lazy factory initialization to avoid circular import."""
+    global _factory
+    if _factory is None:
+        from .factory import EntityFactory
+        _factory = EntityFactory()
+    return _factory
+
 # Optional: chora-inference for LLM tier
 try:
     from chora_inference import InferenceClient, get_registry
@@ -171,6 +182,7 @@ class Route:
     status: str = "canary"  # canary, active, deprecated
     source_traces: List[str] = field(default_factory=list)
     source_learning_ids: List[str] = field(default_factory=list)  # Phase 5: learning lineage
+    taught_at_thresholds: List[int] = field(default_factory=list)  # Hit thresholds where learnings were generated
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
     last_hit_at: Optional[str] = None
 
@@ -186,6 +198,7 @@ class Route:
             "status": self.status,
             "source_traces": self.source_traces,
             "source_learning_ids": self.source_learning_ids,
+            "taught_at_thresholds": self.taught_at_thresholds,
             "created_at": self.created_at,
             "last_hit_at": self.last_hit_at,
         }
@@ -215,7 +228,7 @@ class RouteTable:
                 """
                 SELECT id, tool_id, input_signature, output_template, confidence,
                        hit_count, miss_count, status, source_traces, source_learning_ids,
-                       created_at, last_hit_at
+                       taught_at_thresholds, created_at, last_hit_at
                 FROM routes
                 WHERE tool_id = ? AND input_signature = ? AND status IN ('canary', 'active')
                 """,
@@ -234,6 +247,7 @@ class RouteTable:
                     status=row["status"],
                     source_traces=json.loads(row["source_traces"]),
                     source_learning_ids=json.loads(row["source_learning_ids"]),
+                    taught_at_thresholds=json.loads(row["taught_at_thresholds"]) if row["taught_at_thresholds"] else [],
                     created_at=row["created_at"],
                     last_hit_at=row["last_hit_at"],
                 )
@@ -294,6 +308,125 @@ class RouteTable:
             )
             return result.rowcount > 0
 
+    def get(self, route_id: str) -> Optional[Route]:
+        """
+        Get a route by ID.
+
+        Returns the route if found, None otherwise.
+        """
+        with self.repository._connection() as conn:
+            row = conn.execute(
+                """
+                SELECT id, tool_id, input_signature, output_template, confidence,
+                       hit_count, miss_count, status, source_traces, source_learning_ids,
+                       taught_at_thresholds, created_at, last_hit_at
+                FROM routes
+                WHERE id = ?
+                """,
+                (route_id,),
+            ).fetchone()
+
+            if row:
+                return Route(
+                    id=row["id"],
+                    tool_id=row["tool_id"],
+                    input_signature=row["input_signature"],
+                    output_template=row["output_template"],
+                    confidence=row["confidence"],
+                    hit_count=row["hit_count"],
+                    miss_count=row["miss_count"],
+                    status=row["status"],
+                    source_traces=json.loads(row["source_traces"]),
+                    source_learning_ids=json.loads(row["source_learning_ids"]),
+                    taught_at_thresholds=json.loads(row["taught_at_thresholds"]) if row["taught_at_thresholds"] else [],
+                    created_at=row["created_at"],
+                    last_hit_at=row["last_hit_at"],
+                )
+            return None
+
+    def evaluate_for_teaching(
+        self,
+        route_id: str,
+        hit_threshold: int = 10,
+        factory=None,
+    ) -> Dict[str, Any]:
+        """
+        Evaluate a route for teaching back.
+
+        When a route reaches certain hit thresholds (10, 20, 50, 100, etc.),
+        it generates a learning about what crystallized well. This enables
+        the system to develop "taste" for what operations crystallize effectively.
+
+        Args:
+            route_id: The route to evaluate
+            hit_threshold: Base threshold for teaching (default 10)
+            factory: EntityFactory for creating learnings
+
+        Returns:
+            Dict with 'generated', 'learning_id', 'flagged_for_review' keys
+        """
+        route = self.get(route_id)
+        if not route:
+            return {"generated": False, "learning_id": None, "flagged_for_review": False}
+
+        # Check if route is low-performing (more misses than hits)
+        total = route.hit_count + route.miss_count
+        if total > 0 and route.miss_count > route.hit_count:
+            return {"generated": False, "learning_id": None, "flagged_for_review": True}
+
+        # Determine applicable thresholds: 10, 20, 50, 100, 200, 500, 1000...
+        thresholds = [10, 20, 50, 100, 200, 500, 1000]
+        applicable_threshold = None
+        for t in thresholds:
+            if route.hit_count >= t and t not in route.taught_at_thresholds:
+                applicable_threshold = t
+
+        if applicable_threshold is None:
+            return {"generated": False, "learning_id": None, "flagged_for_review": False}
+
+        # Generate learning about crystallization success
+        if factory is None:
+            return {"generated": False, "learning_id": None, "flagged_for_review": False}
+
+        # Build insight based on threshold level
+        if applicable_threshold == 10:
+            insight = (
+                f"Route {route_id} for {route.tool_id} has crystallized successfully. "
+                f"Input pattern '{route.input_signature[:50]}...' consistently produces stable output. "
+                f"This operation benefits from caching at the data tier."
+            )
+        elif applicable_threshold >= 100:
+            insight = (
+                f"Route {route_id} shows sustained crystallization success with {route.hit_count} hits. "
+                f"The input pattern '{route.input_signature[:50]}...' represents a highly stable operation. "
+                f"Consider this pattern as a template for similar crystallization opportunities."
+            )
+        else:
+            insight = (
+                f"Route {route_id} continues successful crystallization at {route.hit_count} hits (threshold {applicable_threshold}). "
+                f"Input pattern '{route.input_signature[:50]}...' maintains output consistency. "
+                f"Growing evidence of reliable crystallizability."
+            )
+
+        learning = factory.create(
+            'learning',
+            f'Route Crystallization Success: {route.tool_id}',
+            insight=insight,
+            domain='metabolic',
+            tags=['crystallization-success', 'route-wisdom'],
+            context=f"Source: {route_id}, tool: {route.tool_id}, threshold: {applicable_threshold}",
+        )
+
+        # Update route to record teaching threshold
+        with self.repository._connection() as conn:
+            new_thresholds = route.taught_at_thresholds + [applicable_threshold]
+            conn.execute(
+                "UPDATE routes SET taught_at_thresholds = ? WHERE id = ?",
+                (json.dumps(new_thresholds), route_id),
+            )
+
+        return {"generated": True, "learning_id": learning.id, "flagged_for_review": False}
+
     def create(
         self,
         tool_id: str,
@@ -332,8 +465,8 @@ class RouteTable:
                 """
                 INSERT INTO routes (id, tool_id, input_signature, output_template, confidence,
                                    hit_count, miss_count, status, source_traces, source_learning_ids,
-                                   created_at, last_hit_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                   taught_at_thresholds, created_at, last_hit_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     route.id,
@@ -346,6 +479,7 @@ class RouteTable:
                     route.status,
                     json.dumps(route.source_traces),
                     json.dumps(route.source_learning_ids),
+                    json.dumps(route.taught_at_thresholds),
                     route.created_at,
                     route.last_hit_at,
                 ),
@@ -394,6 +528,7 @@ class RouteTable:
                     status=row["status"],
                     source_traces=json.loads(row["source_traces"]),
                     source_learning_ids=json.loads(row["source_learning_ids"]) if row["source_learning_ids"] else [],
+                    taught_at_thresholds=json.loads(row["taught_at_thresholds"]) if row["taught_at_thresholds"] else [],
                     created_at=row["created_at"],
                     last_hit_at=row["last_hit_at"],
                 ))
@@ -405,20 +540,47 @@ class RouteTable:
         tool_id: Optional[str] = None,
         min_traces: int = 5,
         consistency_threshold: float = 0.95,
+        use_embeddings: bool = True,
+        similarity_threshold: float = 0.90,
     ) -> List[Dict[str, Any]]:
         """
         Find trace clusters that are candidates for crystallization into routes.
 
-        Looks for repeated input signatures with consistent outputs.
+        Two modes:
+        - use_embeddings=True: Cluster by semantic similarity (recommended)
+        - use_embeddings=False: Cluster by exact input string match (legacy)
 
         Args:
             tool_id: Filter to specific tool
             min_traces: Minimum similar traces required
             consistency_threshold: Required output consistency (0.0-1.0)
+            use_embeddings: Use semantic clustering (default True)
+            similarity_threshold: Embedding similarity threshold (default 0.90)
 
         Returns:
             List of crystallization candidates with their stats
         """
+        if use_embeddings:
+            return self._find_candidates_with_embeddings(
+                tool_id=tool_id,
+                min_traces=min_traces,
+                consistency_threshold=consistency_threshold,
+                similarity_threshold=similarity_threshold,
+            )
+        else:
+            return self._find_candidates_exact_match(
+                tool_id=tool_id,
+                min_traces=min_traces,
+                consistency_threshold=consistency_threshold,
+            )
+
+    def _find_candidates_exact_match(
+        self,
+        tool_id: Optional[str] = None,
+        min_traces: int = 5,
+        consistency_threshold: float = 0.95,
+    ) -> List[Dict[str, Any]]:
+        """Legacy exact-match clustering (for backwards compatibility)."""
         query = """
             SELECT
                 capability_id,
@@ -471,6 +633,124 @@ class RouteTable:
                             "consistency": most_common_pct,
                             "success_rate": row["success_rate"],
                         })
+
+        return candidates
+
+    def _find_candidates_with_embeddings(
+        self,
+        tool_id: Optional[str] = None,
+        min_traces: int = 5,
+        consistency_threshold: float = 0.95,
+        similarity_threshold: float = 0.90,
+    ) -> List[Dict[str, Any]]:
+        """
+        Find crystallization candidates using semantic embedding similarity.
+
+        This is the recommended approach: traces with semantically similar
+        inputs are clustered together, even if the exact strings differ.
+        """
+        from .embeddings import EmbeddingService
+        import os
+
+        # Initialize embedding service (use OpenAI if available)
+        provider = 'openai' if os.environ.get('OPENAI_API_KEY') else 'local'
+        embedding_service = EmbeddingService(self.repository.db_path, provider=provider)
+
+        # Load traces for clustering
+        query = """
+            SELECT id, capability_id, inputs, outputs
+            FROM traces
+            WHERE success = 1
+              AND tier IN ('inference', 'agent')
+        """
+        params: List[Any] = []
+
+        if tool_id:
+            query += " AND capability_id = ?"
+            params.append(tool_id)
+
+        traces = []
+        with self.repository._connection() as conn:
+            for row in conn.execute(query, params):
+                traces.append({
+                    "id": row["id"],
+                    "tool_id": row["capability_id"],
+                    "inputs": row["inputs"],
+                    "outputs": row["outputs"],
+                })
+
+        if len(traces) < min_traces:
+            return []
+
+        # Group traces by tool_id first (routes are tool-specific)
+        traces_by_tool: Dict[str, List[Dict]] = {}
+        for trace in traces:
+            tid = trace["tool_id"]
+            if tid not in traces_by_tool:
+                traces_by_tool[tid] = []
+            traces_by_tool[tid].append(trace)
+
+        candidates = []
+
+        for tid, tool_traces in traces_by_tool.items():
+            if len(tool_traces) < min_traces:
+                continue
+
+            # Get embeddings for inputs
+            import numpy as np
+            input_texts = [t["inputs"] for t in tool_traces]
+            embeddings = [embedding_service.embed_text(text) for text in input_texts]
+
+            # Greedy clustering by similarity
+            assigned = set()
+            clusters = []
+
+            for i, trace in enumerate(tool_traces):
+                if i in assigned:
+                    continue
+
+                cluster = [trace]
+                cluster_indices = [i]
+                assigned.add(i)
+
+                for j, other_trace in enumerate(tool_traces):
+                    if j in assigned:
+                        continue
+
+                    sim = embedding_service.cosine_similarity(embeddings[i], embeddings[j])
+                    if sim >= similarity_threshold:
+                        cluster.append(other_trace)
+                        cluster_indices.append(j)
+                        assigned.add(j)
+
+                if len(cluster) >= min_traces:
+                    clusters.append(cluster)
+
+            # Evaluate each cluster for output consistency
+            for cluster in clusters:
+                output_counts: Dict[str, int] = {}
+                for trace in cluster:
+                    out = trace["outputs"]
+                    output_counts[out] = output_counts.get(out, 0) + 1
+
+                total = sum(output_counts.values())
+                most_common_output = max(output_counts.keys(), key=lambda k: output_counts[k])
+                most_common_count = output_counts[most_common_output]
+                consistency = most_common_count / total
+
+                if consistency >= consistency_threshold:
+                    # Use centroid input as signature (first trace in cluster)
+                    candidates.append({
+                        "tool_id": tid,
+                        "input_signature": cluster[0]["inputs"],  # Representative input
+                        "output_template": most_common_output,
+                        "trace_count": len(cluster),
+                        "consistency": consistency,
+                        "success_rate": 1.0,  # All traces were successful
+                        "source_trace_ids": [t["id"] for t in cluster],
+                        "clustering_method": "embedding",
+                        "similarity_threshold": similarity_threshold,
+                    })
 
         return candidates
 
@@ -540,6 +820,29 @@ class RouteTable:
                 confidence=candidate["consistency"],
             )
             new_routes.append(route)
+
+            # Emit learning about crystallization (Push-Right in action)
+            try:
+                factory = _get_factory()
+                factory.create(
+                    'learning',
+                    f'Route crystallized for {candidate["tool_id"]}',
+                    insight=(
+                        f"Inference traces crystallized into data-tier route. "
+                        f"Input pattern matched {candidate['trace_count']} times "
+                        f"with {candidate['consistency']:.0%} consistency. "
+                        f"Future calls with this input will resolve at data tier."
+                    ),
+                    domain='tiered-resolution',
+                    implications=(
+                        "This is Push-Right in action: hot inference operations "
+                        "have cooled into solid data lookups. System wisdom increases."
+                    ),
+                    related=[route.id, candidate["tool_id"]],
+                )
+            except Exception:
+                # Learning emission is optional - don't fail crystallization
+                pass
 
         return new_routes
 
@@ -808,13 +1111,13 @@ class MetabolicEngine(PatternInductor):
         route_table = RouteTable(self.repository)
         input_signature = json.dumps(sorted(learning_ids))  # Canonical signature
 
-        route = route_table.lookup("tool-synthesize-learnings", input_signature)
+        route = route_table.lookup("tool-learning-synthesize", input_signature)
         if route:
             with TraceCapture(
                 self.repository,
                 operation_type="synthesize",
                 tier="data",
-                capability_id="tool-synthesize-learnings",
+                capability_id="tool-learning-synthesize",
             ) as trace:
                 trace.set_inputs(learning_ids)
                 trace.step(f"Route hit: {route.id}")
@@ -874,14 +1177,14 @@ class MetabolicEngine(PatternInductor):
             self.repository,
             operation_type="synthesize",
             tier="workflow",
-            capability_id="tool-synthesize-learnings",
+            capability_id="tool-learning-synthesize",
         ) as trace:
             trace.set_inputs(learning_ids)
             trace.step("Attempting workflow-tier synthesis via PatternInductor")
             trace.set_cost(10.0)  # Relative cost for workflow tier
 
             # Run algorithmic clustering on the specific learnings
-            proposals = self._cluster_learnings(learnings)
+            proposals = self._generate_proposals_from_learnings(learnings)
 
             if proposals:
                 best = max(proposals, key=lambda p: p.confidence)
@@ -914,7 +1217,7 @@ class MetabolicEngine(PatternInductor):
             self.repository,
             operation_type="synthesize",
             tier="inference",
-            capability_id="tool-synthesize-learnings",
+            capability_id="tool-learning-synthesize",
         ) as trace:
             trace.set_inputs(learning_ids)
             trace.step("Escalating to inference tier for semantic synthesis")
@@ -1013,13 +1316,18 @@ class MetabolicEngine(PatternInductor):
 
         return result
 
-    def _cluster_learnings(self, learnings: List[Entity]) -> List[Any]:
+    def _generate_proposals_from_learnings(self, learnings: List[Entity] = None) -> List[Any]:
         """
-        Cluster specific learnings using PatternInductor logic.
+        Generate pattern proposals from a specific set of learnings.
 
-        This is a targeted version of analyze() that works on a specific set.
+        This clusters learnings by keyword overlap and generates proposals.
+        Note: This is distinct from parent's _cluster_learnings() which returns clusters.
         """
         from .evaluator import PatternProposal
+
+        # Load learnings if not provided (maintains inheritance contract with parent)
+        if learnings is None:
+            learnings = self._load_learnings()
 
         if len(learnings) < 2:
             return []
@@ -1102,6 +1410,165 @@ class MetabolicEngine(PatternInductor):
 
         return "\n".join(lines)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # AUTO-CRYSTALLIZATION CRON HOOK
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def auto_crystallize_cron(
+        self,
+        min_traces: int = 5,
+        consistency_threshold: float = 0.95,
+        factory=None,
+    ) -> Dict[str, Any]:
+        """
+        Cron hook for automatic route crystallization.
+
+        This method is designed to be called periodically (e.g., cron:daily)
+        to crystallize high-frequency trace patterns into data-tier routes.
+
+        Args:
+            min_traces: Minimum traces required for crystallization (default 5)
+            consistency_threshold: Required output consistency (default 0.95)
+            factory: Optional EntityFactory for creating learnings (uses global if not provided)
+
+        Returns:
+            {
+                "routes_created": int,
+                "tools_processed": int,
+                "learning_id": str | None,
+                "details": List[Dict]  # Per-route details
+            }
+        """
+        route_table = RouteTable(self.repository)
+
+        # Find all unique tool IDs with traces
+        tool_ids = set()
+        with self.repository._connection() as conn:
+            for row in conn.execute(
+                """SELECT DISTINCT capability_id FROM traces
+                   WHERE success = 1 AND tier IN ('inference', 'agent')
+                   AND capability_id IS NOT NULL"""
+            ):
+                tool_ids.add(row["capability_id"])
+
+        result = {
+            "routes_created": 0,
+            "tools_processed": len(tool_ids),
+            "learning_id": None,
+            "details": [],
+        }
+
+        # Process each tool
+        all_new_routes = []
+        for tool_id in tool_ids:
+            new_routes = route_table.auto_crystallize(
+                tool_id=tool_id,
+                min_traces=min_traces,
+                consistency_threshold=consistency_threshold,
+            )
+            for route in new_routes:
+                all_new_routes.append(route)
+                result["details"].append({
+                    "route_id": route.id,
+                    "tool_id": route.tool_id,
+                    "input_signature": route.input_signature[:50] + "..." if len(route.input_signature) > 50 else route.input_signature,
+                })
+
+        result["routes_created"] = len(all_new_routes)
+
+        # Emit summary learning if routes were created
+        if all_new_routes:
+            fact = factory or _get_factory()
+            try:
+                learning = fact.create(
+                    "learning",
+                    f"Auto-crystallized {len(all_new_routes)} routes",
+                    insight=(
+                        f"Cron hook crystallized {len(all_new_routes)} routes from "
+                        f"{len(tool_ids)} tools. Hot inference operations have "
+                        f"cooled into data-tier lookups."
+                    ),
+                    domain="tiered-resolution",
+                    implications=(
+                        "System metabolic efficiency increases as more operations "
+                        "resolve at cheaper tiers."
+                    ),
+                    related=[r.id for r in all_new_routes[:10]],  # Link first 10
+                )
+                result["learning_id"] = learning.id
+            except Exception:
+                # Learning creation is optional
+                pass
+
+        return result
+
+    def route_teach_back_cron(
+        self,
+        hit_threshold: int = 10,
+        factory=None,
+    ) -> Dict[str, Any]:
+        """
+        Cron hook for routes teaching back.
+
+        This method evaluates successful routes and generates learnings about
+        what crystallizes well. These learnings can cluster into meta-patterns
+        about crystallizability - the system developing "taste" for what
+        operations are good candidates for crystallization.
+
+        Args:
+            hit_threshold: Base threshold for teaching (default 10)
+            factory: Optional EntityFactory for creating learnings
+
+        Returns:
+            {
+                "learnings_generated": int,
+                "routes_evaluated": int,
+                "routes_marked": int,
+                "flagged_for_review": int,
+                "details": List[Dict]
+            }
+        """
+        route_table = RouteTable(self.repository)
+        fact = factory or _get_factory()
+
+        result = {
+            "learnings_generated": 0,
+            "routes_evaluated": 0,
+            "routes_marked": 0,
+            "flagged_for_review": 0,
+            "details": [],
+        }
+
+        # Get all routes that might be ready for teaching
+        # (hit_count >= threshold and not already taught at that level)
+        routes = route_table.list_routes(status="active", limit=1000)
+        routes.extend(route_table.list_routes(status="canary", limit=1000))
+
+        for route in routes:
+            if route.hit_count < hit_threshold:
+                continue
+
+            result["routes_evaluated"] += 1
+
+            teach_result = route_table.evaluate_for_teaching(
+                route_id=route.id,
+                hit_threshold=hit_threshold,
+                factory=fact,
+            )
+
+            if teach_result.get("generated"):
+                result["learnings_generated"] += 1
+                result["routes_marked"] += 1
+                result["details"].append({
+                    "route_id": route.id,
+                    "learning_id": teach_result.get("learning_id"),
+                    "hit_count": route.hit_count,
+                })
+            elif teach_result.get("flagged_for_review"):
+                result["flagged_for_review"] += 1
+
+        return result
+
 
 def tool_induction(domain: Optional[str] = None) -> str:
     """
@@ -1148,6 +1615,97 @@ def tool_induction(domain: Optional[str] = None) -> str:
     if not result['proposals'] and not result['surprises']:
         lines.append("")
         lines.append("(System is metabolically balanced. No clusters or outliers found.)")
+
+    return "\n".join(lines)
+
+
+def tool_auto_induction(
+    min_learnings: int = 2,
+    confidence_threshold: float = 0.7,
+    auto_approve: bool = True,
+    max_approvals: int = 3,
+    include_cross_domain: bool = False,
+) -> str:
+    """
+    Continuous Mutation Engine - runs induction and auto-approves.
+
+    This tool is designed to be invoked by a cron:daily hook to maintain
+    continuous mutation pressure in the autoevolutionary loop.
+
+    Args:
+        min_learnings: Minimum learnings per cluster (default 2)
+        confidence_threshold: Minimum confidence to auto-approve (default 0.7)
+        auto_approve: Whether to auto-approve high-confidence proposals
+        max_approvals: Maximum proposals to approve per run (default 3)
+        include_cross_domain: Whether to detect cross-domain bridges (default False)
+
+    Returns:
+        Report of proposals found and patterns approved
+    """
+    from .evaluator import PatternInductor
+    from .models import Entity
+
+    repo = EntityRepository()
+    inductor = PatternInductor(repo, thresholds={
+        "min_learnings": min_learnings,
+        "confidence_threshold": 0.6,  # Lower threshold to see more proposals
+        "max_proposals": 5,
+        "keyword_overlap": 0.05,
+        "embedding_similarity": 0.70,
+    })
+
+    proposals = inductor.analyze(include_cross_domain=include_cross_domain)
+    approved = []
+    skipped = []
+
+    if auto_approve and proposals:
+        for p in proposals:
+            if len(approved) >= max_approvals:
+                skipped.append((p, "max_approvals reached"))
+                continue
+
+            if p.confidence >= confidence_threshold:
+                try:
+                    pattern = inductor.approve_proposal(p)
+                    if pattern:
+                        approved.append((p, pattern))
+                except Exception as e:
+                    skipped.append((p, f"error: {e}"))
+            else:
+                skipped.append((p, f"confidence {p.confidence:.2f} < {confidence_threshold}"))
+
+    # Build report
+    lines = ["AUTO-INDUCTION REPORT"]
+    lines.append("=" * 40)
+    lines.append(f"Proposals found: {len(proposals)}")
+    lines.append(f"Auto-approved: {len(approved)}")
+    lines.append(f"Skipped: {len(skipped)}")
+
+    if approved:
+        lines.append("")
+        lines.append("APPROVED PATTERNS:")
+        for proposal, pattern in approved:
+            lines.append(f"  ✓ {pattern.id}")
+            if proposal.cross_domain:
+                domain_str = " + ".join(proposal.source_domains)
+                lines.append(f"    From: {len(proposal.source_learnings)} learnings spanning '{domain_str}' (CROSS-DOMAIN)")
+                lines.append(f"    Bridge strength: {proposal.bridge_strength:.2f}")
+            else:
+                lines.append(f"    From: {len(proposal.source_learnings)} learnings in '{proposal.domain}'")
+            lines.append(f"    Confidence: {proposal.confidence:.2f}")
+            gen = pattern.data.get("loop_generation", "?")
+            lines.append(f"    Loop generation: {gen}")
+
+    if skipped:
+        lines.append("")
+        lines.append("SKIPPED (requires manual review):")
+        for proposal, reason in skipped:
+            lines.append(f"  - {proposal.name}")
+            lines.append(f"    Reason: {reason}")
+
+    if not proposals:
+        lines.append("")
+        lines.append("(No proposals ready. System metabolically balanced.)")
 
     return "\n".join(lines)
 
@@ -1365,3 +1923,207 @@ def tool_propose_synthesis(
         )
     except Exception as e:
         return f"Error during synthesis: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FOCUS CREATION FROM NATURAL LANGUAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def tool_focus_create(
+    goal: str,
+    target: Optional[str] = None,
+    agent: str = "claude",
+    ttl_minutes: int = 240,
+    repository: Optional[EntityRepository] = None,
+) -> str:
+    """
+    Create focus from natural language goal description.
+
+    Fills the creation gap in the focus lifecycle - enables agents to create
+    focus entities without requiring a pre-existing feature to engage.
+
+    Args:
+        goal: Natural language description of what to focus on
+        target: Optional explicit target entity ID (feature-*, inquiry-*, etc.)
+        agent: Agent creating the focus (default: "claude")
+        ttl_minutes: Time-to-live in minutes (default: 240 = 4 hours)
+        repository: Optional repository (uses global if not provided)
+
+    Returns:
+        Status message with focus ID or error
+    """
+    repo = repository or EntityRepository()
+    # Create factory with test repository if provided
+    if repository:
+        from .factory import EntityFactory
+        factory = EntityFactory(repository=repository)
+    else:
+        factory = _get_factory()
+
+    # If target provided, validate it exists
+    resolved_target = None
+    candidate_targets = []
+    created_inquiry = None
+
+    if target:
+        entity = repo.read(target)
+        if not entity:
+            return f"Error: Target entity '{target}' not found"
+        resolved_target = target
+    else:
+        # Try to resolve target from goal text
+        resolved_target, candidate_targets = _resolve_target_from_goal(repo, goal)
+
+    # If no target resolved, create implicit inquiry from goal
+    # Focus requires a target - we create an inquiry to hold the goal
+    if not resolved_target:
+        created_inquiry = factory.create(
+            "inquiry",
+            goal,
+            question=goal,
+            domain="focus-created",
+        )
+        resolved_target = created_inquiry.id
+
+    # Generate focus name from goal
+    focus_name = _generate_focus_name(goal, agent)
+
+    # Build focus data
+    focus_data = {
+        "agent": agent,
+        "entry_type": "natural_language",
+        "goal_level": True,
+        "ttl_minutes": ttl_minutes,
+        "trail": [],
+        "original_goal": goal,
+    }
+
+    if resolved_target:
+        focus_data["target"] = resolved_target
+        focus_data["links"] = [resolved_target]
+
+    if candidate_targets:
+        focus_data["candidate_targets"] = candidate_targets
+
+    # Create focus via factory (applies epigenetic patterns)
+    try:
+        focus = factory.create(
+            "focus",
+            focus_name,
+            target=resolved_target,
+            agent=agent,
+            entry_type="natural_language",
+            goal_level=True,
+            ttl_minutes=ttl_minutes,
+            trail=[],
+            original_goal=goal,
+            candidate_targets=candidate_targets if candidate_targets else None,
+        )
+
+        result = f"Focus created: {focus.id}"
+        if resolved_target:
+            result += f" → {resolved_target}"
+        if candidate_targets:
+            result += f"\nAmbiguous target - candidates: {candidate_targets}"
+
+        return result
+
+    except Exception as e:
+        return f"Error creating focus: {e}"
+
+
+def _resolve_target_from_goal(repo: EntityRepository, goal: str) -> tuple:
+    """
+    Attempt to resolve a target entity from goal text.
+
+    Returns:
+        (resolved_target, candidate_targets) - resolved if single match,
+        candidates if ambiguous, both None if no match
+    """
+    goal_lower = goal.lower()
+    goal_words = set(goal_lower.split())
+
+    # Search features and inquiries for matches
+    candidates = []
+
+    def score_match(name: str) -> int:
+        """Score how well entity name matches goal. Returns 0 for no match."""
+        name_lower = name.lower()
+        name_words = set(name_lower.split())
+        # Check bidirectional: goal in name OR name in goal OR word overlap
+        if name_lower in goal_lower or goal_lower in name_lower:
+            return len(name)
+        # Check word overlap
+        overlap = goal_words & name_words
+        if overlap:
+            return len(overlap) * 10  # Weight by overlap count
+        return 0
+
+    # Check features
+    features = repo.list(entity_type="feature", limit=100)
+    for f in features:
+        name = f.data.get("name", "")
+        score = score_match(name)
+        if score > 0:
+            candidates.append((f.id, score))
+
+    # Check inquiries
+    inquiries = repo.list(entity_type="inquiry", limit=100)
+    for i in inquiries:
+        name = i.data.get("name", "")
+        score = score_match(name)
+        if score > 0:
+            candidates.append((i.id, score))
+
+    if not candidates:
+        return None, []
+
+    # Sort by match length (longer = more specific)
+    candidates.sort(key=lambda x: -x[1])
+
+    if len(candidates) == 1:
+        return candidates[0][0], []
+
+    # Multiple candidates - check if top match is significantly better
+    if candidates[0][1] > candidates[1][1] * 1.5:
+        return candidates[0][0], []
+
+    # Ambiguous - return candidates
+    candidate_ids = [c[0] for c in candidates[:5]]  # Top 5
+    return None, candidate_ids
+
+
+def _generate_focus_name(goal: str, agent: str) -> str:
+    """
+    Generate a focus name from goal description.
+
+    Examples:
+        "Implement cross-domain detection" → "Implementing cross-domain detection"
+        "Work on voice canvas" → "Working on voice canvas"
+    """
+    goal = goal.strip()
+
+    # Convert imperative to gerund if possible
+    if goal.lower().startswith("implement"):
+        return "Implementing" + goal[9:]
+    elif goal.lower().startswith("work on"):
+        return "Working on" + goal[7:]
+    elif goal.lower().startswith("build"):
+        return "Building" + goal[5:]
+    elif goal.lower().startswith("fix"):
+        return "Fixing" + goal[3:]
+    elif goal.lower().startswith("explore"):
+        return "Exploring" + goal[7:]
+    elif goal.lower().startswith("investigate"):
+        return "Investigating" + goal[11:]
+    elif goal.lower().startswith("add"):
+        return "Adding" + goal[3:]
+    elif goal.lower().startswith("create"):
+        return "Creating" + goal[6:]
+    elif goal.lower().startswith("design"):
+        return "Designing" + goal[6:]
+    elif goal.lower().startswith("research"):
+        return "Researching" + goal[8:]
+
+    # Default: just capitalize
+    return goal[0].upper() + goal[1:]

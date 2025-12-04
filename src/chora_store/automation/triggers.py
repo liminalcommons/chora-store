@@ -19,6 +19,9 @@ class EventType(Enum):
     GIT_PRE_COMMIT = "git.pre-commit"
     GIT_POST_COMMIT = "git.post-commit"
     GIT_PRE_PUSH = "git.pre-push"
+    # Scheduled events (agent-triggered, not system cron)
+    CRON_DAILY = "cron.daily"
+    CRON_SESSION_START = "cron.session_start"
 
 
 @dataclass
@@ -120,6 +123,20 @@ class TriggerRegistry:
             handler=self._action_backup_check,
         ))
 
+        # Auto-induction action (Experiment 3: Autoevolutionary Loop)
+        self.register_action(Action(
+            name="auto_induction",
+            description="Cluster learnings and propose patterns automatically",
+            handler=self._action_auto_induction,
+        ))
+
+        # Feature TTL check action
+        self.register_action(Action(
+            name="feature_ttl_check",
+            description="Check for stale features past their TTL",
+            handler=self._action_feature_ttl_check,
+        ))
+
     def _action_validate(self, context: Dict[str, Any]) -> bool:
         """Validate an entity."""
         entity_id = context.get("entity_id")
@@ -143,6 +160,59 @@ class TriggerRegistry:
         if status.configured and not status.running:
             print(f"[backup_check] Warning: Backup configured but not running")
         return True
+
+    def _action_auto_induction(self, context: Dict[str, Any]) -> bool:
+        """Run auto-induction to cluster learnings and propose patterns."""
+        try:
+            from ..metabolism import tool_auto_induction
+            result = tool_auto_induction(
+                min_learnings=context.get("min_learnings", 3),
+                confidence_threshold=context.get("confidence_threshold", 0.6),
+                auto_approve=context.get("auto_approve", False),
+                max_approvals=context.get("max_approvals", 3),
+            )
+            print(f"[auto_induction] {result}")
+            return True
+        except Exception as e:
+            print(f"[auto_induction] Error: {e}")
+            return False
+
+    def _action_feature_ttl_check(self, context: Dict[str, Any]) -> bool:
+        """Check for features that have exceeded their TTL."""
+        try:
+            from ..repository import EntityRepository
+            from datetime import datetime, timezone, timedelta
+
+            repo = EntityRepository()
+            features = repo.list(entity_type="feature", limit=100)
+
+            stale_count = 0
+            now = datetime.now(timezone.utc)
+
+            for feature in features:
+                if feature.status == "nascent":
+                    ttl_days = feature.data.get("ttl_days", 30)
+                    # Handle timezone-naive datetimes
+                    created = feature.created_at
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    age = (now - created).days
+                    if age > ttl_days:
+                        # Mark drift signal
+                        drift_signals = feature.data.get("drift_signals", [])
+                        if "ttl_expired" not in drift_signals:
+                            drift_signals.append("ttl_expired")
+                            feature.data["drift_signals"] = drift_signals
+                            repo.update(feature)
+                            print(f"[feature_ttl_check] {feature.id}: TTL expired ({age} days > {ttl_days})")
+                            stale_count += 1
+
+            if stale_count > 0:
+                print(f"[feature_ttl_check] Flagged {stale_count} stale features")
+            return True
+        except Exception as e:
+            print(f"[feature_ttl_check] Error: {e}")
+            return False
 
     def register_action(self, action: Action) -> None:
         """Register an action."""
@@ -216,6 +286,12 @@ class TriggerRegistry:
             actions=["lint"],
         ))
 
+        # Cron triggers (agent-fired, not system cron)
+        self.register_trigger(Trigger(
+            event_type=EventType.CRON_DAILY,
+            actions=["auto_induction", "feature_ttl_check"],
+        ))
+
 
 # Global registry instance
 _registry: Optional[TriggerRegistry] = None
@@ -228,3 +304,40 @@ def get_registry() -> TriggerRegistry:
         _registry = TriggerRegistry()
         _registry.load_default_triggers()
     return _registry
+
+
+def fire_daily_cron(context: Optional[Dict[str, Any]] = None) -> List[str]:
+    """
+    Fire the daily cron event.
+
+    This is meant to be called by agents periodically (e.g., at session start
+    or when requested). It runs all actions registered for CRON_DAILY.
+
+    Args:
+        context: Optional context to pass to actions
+
+    Returns:
+        List of action names that were executed
+    """
+    registry = get_registry()
+    ctx = context or {}
+    executed = registry.fire(EventType.CRON_DAILY, ctx)
+    return executed
+
+
+def fire_session_start(context: Optional[Dict[str, Any]] = None) -> List[str]:
+    """
+    Fire the session start event.
+
+    Called at the beginning of an agent session to run any session-start tasks.
+
+    Args:
+        context: Optional context to pass to actions
+
+    Returns:
+        List of action names that were executed
+    """
+    registry = get_registry()
+    ctx = context or {}
+    executed = registry.fire(EventType.CRON_SESSION_START, ctx)
+    return executed

@@ -57,14 +57,14 @@ class TestEntityCreation:
 
         assert entity.id == "feature-voice-canvas"
         assert entity.type == "feature"
-        assert entity.status == "intended"  # Signal captured, system holds intent
+        assert entity.status == "nascent"  # Just crystallized, direction emerging
         assert entity.data["name"] == "Voice Canvas"
 
     def test_create_with_custom_status(self, factory):
         """Test creating entity with custom status."""
-        entity = factory.create("feature", "Test Feature", status="reifying")
+        entity = factory.create("feature", "Test Feature", status="converging")
 
-        assert entity.status == "reifying"  # Structure emerging from gas
+        assert entity.status == "converging"  # Distance shrinking
 
     def test_create_pattern(self, factory):
         """Test creating a pattern entity."""
@@ -159,12 +159,12 @@ class TestEventEmission:
         events = []
         factory.observer.on_change(lambda e: events.append(e))
 
-        factory.update(entity.id, status="reifying")
+        factory.update(entity.id, status="converging")
 
         assert len(events) == 1
         assert events[0].change_type == ChangeType.UPDATED
-        assert events[0].old_status == "intended"
-        assert events[0].new_status == "reifying"
+        assert events[0].old_status == "nascent"
+        assert events[0].new_status == "converging"
 
     def test_delete_emits_event(self, factory):
         """Test that delete emits DELETED event."""
@@ -185,10 +185,10 @@ class TestEntityUpdate:
     def test_update_status(self, factory):
         """Test updating entity status."""
         entity = factory.create("feature", "Status Test")
-        assert entity.status == "intended"  # Signal captured
+        assert entity.status == "nascent"  # Just crystallized
 
-        updated = factory.update(entity.id, status="reifying")
-        assert updated.status == "reifying"  # Structure emerging
+        updated = factory.update(entity.id, status="converging")
+        assert updated.status == "converging"  # Distance shrinking
 
     def test_update_data(self, factory):
         """Test updating entity data fields."""
@@ -202,7 +202,7 @@ class TestEntityUpdate:
         entity = factory.create("feature", "Version Test")
         assert entity.version == 1
 
-        updated = factory.update(entity.id, status="reifying")
+        updated = factory.update(entity.id, status="converging")
         assert updated.version == 2
 
 
@@ -231,15 +231,15 @@ class TestEntityListing:
 
     def test_list_by_status(self, factory):
         """Test listing entities by status."""
-        factory.create("feature", "Status Test 1", status="intended")
-        e2 = factory.create("feature", "Status Test 2", status="intended")
-        factory.update(e2.id, status="reifying")
+        factory.create("feature", "Status Test 1", status="nascent")
+        e2 = factory.create("feature", "Status Test 2", status="nascent")
+        factory.update(e2.id, status="converging")
 
-        intended = factory.list(status="intended")
-        reifying = factory.list(status="reifying")
+        nascent = factory.list(status="nascent")
+        converging = factory.list(status="converging")
 
-        assert all(e.status == "intended" for e in intended)
-        assert all(e.status == "reifying" for e in reifying)
+        assert all(e.status == "nascent" for e in nascent)
+        assert all(e.status == "converging" for e in converging)
 
 
 class TestPhysicsEngine:
@@ -267,3 +267,125 @@ class TestPhysicsEngine:
             assert entity.status in factory.get_valid_statuses(entity.type)
             # Every entity ID should match pattern
             assert entity.id.startswith(f"{entity.type}-")
+
+
+class TestTransitionValidation:
+    """Test status transition validation."""
+
+    def test_nascent_to_converging_allowed(self, factory):
+        """Test that nascent → converging is allowed."""
+        entity = factory.create("feature", "Transition Test 1")
+        assert entity.status == "nascent"
+
+        updated = factory.update(entity.id, status="converging")
+        assert updated.status == "converging"
+
+    def test_nascent_to_stable_blocked(self, factory):
+        """Test that nascent → stable is blocked (cannot skip converging)."""
+        entity = factory.create("feature", "Transition Test 2")
+
+        with pytest.raises(ValidationError) as exc:
+            factory.update(entity.id, status="stable")
+
+        assert "Cannot skip" in str(exc.value) or "cannot go from" in str(exc.value)
+
+    def test_converging_to_stable_requires_behaviors(self, factory):
+        """Test that converging → stable requires behaviors."""
+        entity = factory.create("feature", "Transition Test 3")
+        factory.update(entity.id, status="converging")
+
+        with pytest.raises(ValidationError) as exc:
+            factory.update(entity.id, status="stable")
+
+        assert "behaviors" in str(exc.value).lower()
+
+    def test_converging_to_stable_requires_passing_behaviors(self, factory):
+        """Test that converging → stable requires all behaviors passing."""
+        entity = factory.create("feature", "Transition Test 4")
+        factory.update(
+            entity.id,
+            status="converging",
+            behaviors=[
+                {
+                    "id": "behavior-test",
+                    "given": "precondition",
+                    "when": "action",
+                    "then": "outcome",
+                    "verifiable_by": "manual",
+                    "status": "untested",  # Not passing
+                }
+            ],
+        )
+
+        with pytest.raises(ValidationError) as exc:
+            factory.update(entity.id, status="stable")
+
+        assert "not passing" in str(exc.value).lower() or "behaviors" in str(exc.value).lower()
+
+    def test_converging_to_stable_succeeds_with_passing_behaviors(self, factory):
+        """Test that converging → stable succeeds when all behaviors pass."""
+        entity = factory.create("feature", "Transition Test 5")
+        factory.update(
+            entity.id,
+            status="converging",
+            behaviors=[
+                {
+                    "id": "behavior-test",
+                    "given": "precondition",
+                    "when": "action",
+                    "then": "outcome",
+                    "verifiable_by": "manual",
+                    "status": "passing",
+                }
+            ],
+        )
+
+        updated = factory.update(entity.id, status="stable")
+        assert updated.status == "stable"
+
+
+class TestBehaviorDriftSignal:
+    """Test that failing behaviors emit drift signals."""
+
+    def test_stable_with_failing_behavior_emits_drift_signal(self, factory):
+        """Test that updating a stable feature with failing behavior emits drift signal."""
+        # Create stable feature with passing behavior
+        entity = factory.create("feature", "Drift Signal Test")
+        factory.update(
+            entity.id,
+            status="converging",
+            behaviors=[
+                {
+                    "id": "behavior-test",
+                    "given": "precondition",
+                    "when": "action",
+                    "then": "outcome",
+                    "verifiable_by": "manual",
+                    "status": "passing",
+                }
+            ],
+        )
+        factory.update(entity.id, status="stable")
+
+        # Clear event log
+        factory.observer.clear_log()
+
+        # Update with failing behavior
+        factory.update(
+            entity.id,
+            behaviors=[
+                {
+                    "id": "behavior-test",
+                    "given": "precondition",
+                    "when": "action",
+                    "then": "outcome",
+                    "verifiable_by": "manual",
+                    "status": "failing",
+                }
+            ],
+        )
+
+        # Check for drift signal in event log
+        events = factory.observer.get_recent_events(entity_type="feature")
+        drift_signals = [e for e in events if e.new_status == "drift_signal"]
+        assert len(drift_signals) >= 1

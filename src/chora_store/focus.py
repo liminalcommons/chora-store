@@ -28,6 +28,7 @@ Entry Types:
 - discovered: System detects focus from activity
 """
 
+import warnings
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field
@@ -104,6 +105,10 @@ class FocusManager:
         """
         Create a new focus on a target entity (declared entry).
 
+        .. deprecated::
+            FocusManager is deprecated. Use Factory.create('focus', ...) instead.
+            This ensures structural governance, observer signals, and epigenetic patterns.
+
         Args:
             target_id: The entity to focus on
             agent: Identifier for the agent creating focus
@@ -115,6 +120,12 @@ class FocusManager:
         Returns:
             Focus object
         """
+        warnings.warn(
+            "FocusManager.create_focus is deprecated. "
+            "Use Factory.create('focus', ...) instead for structural governance.",
+            DeprecationWarning,
+            stacklevel=2
+        )
         now = datetime.utcnow()
         now_iso = now.isoformat()
 
@@ -354,19 +365,24 @@ class FocusManager:
 
         # Get open foci (active work)
         for focus in self._list_foci(status=FOCUS_STATUS_OPEN):
-            candidates.append({
+            candidate = {
                 'id': focus.id,
                 'target': focus.target,
                 'agent': focus.agent,
                 'status': FOCUS_STATUS_OPEN,
                 'entry_type': focus.data.get('entry_type', FOCUS_ENTRY_DECLARED),
                 'started_at': focus.started_at,
-                'is_own': focus.agent == agent
-            })
+                'is_own': focus.agent == agent,
+                # Aliveness fields - what makes a focus mark feel alive
+                'felt_quality': focus.data.get('felt_quality'),
+                'care_at_center': focus.data.get('care_at_center'),
+                'handoff_note': focus.data.get('handoff_note'),
+            }
+            candidates.append(candidate)
 
         # Get unlocked foci (need decision: resume or finalize)
         for focus in self._list_foci(status=FOCUS_STATUS_UNLOCKED):
-            candidates.append({
+            candidate = {
                 'id': focus.id,
                 'target': focus.target,
                 'agent': focus.agent,
@@ -374,10 +390,70 @@ class FocusManager:
                 'entry_type': focus.data.get('entry_type', FOCUS_ENTRY_DECLARED),
                 'started_at': focus.started_at,
                 'is_own': focus.agent == agent,
-                'needs_decision': True  # Resume or finalize?
-            })
+                'needs_decision': True,  # Resume or finalize?
+                # Aliveness fields
+                'felt_quality': focus.data.get('felt_quality'),
+                'care_at_center': focus.data.get('care_at_center'),
+                'handoff_note': focus.data.get('handoff_note'),
+            }
+            candidates.append(candidate)
 
         return candidates
+
+    def get_recent_handoffs(self, limit: int = 5, days: int = 7) -> List[Dict[str, Any]]:
+        """
+        Get recent handoff notes from finalized foci.
+
+        These are gifts left behind by previous agents - cairns on the trail.
+        Shows foci with handoff_note that were finalized in the last N days.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        handoffs = []
+
+        for focus in self._list_foci(status=FOCUS_STATUS_FINALIZED):
+            # Check for handoff note
+            note = focus.data.get('handoff_note')
+            if not note:
+                continue
+
+            # Check recency
+            finalized_at = focus.data.get('finalized_at')
+            if finalized_at:
+                try:
+                    if isinstance(finalized_at, str):
+                        # Parse ISO format
+                        if finalized_at.endswith('Z'):
+                            finalized_at = finalized_at[:-1] + '+00:00'
+                        finalized_dt = datetime.fromisoformat(finalized_at)
+                    else:
+                        finalized_dt = finalized_at
+
+                    # Make timezone-aware if needed
+                    if finalized_dt.tzinfo is None:
+                        finalized_dt = finalized_dt.replace(tzinfo=timezone.utc)
+
+                    if finalized_dt < cutoff:
+                        continue
+                except (ValueError, TypeError):
+                    pass  # Include if we can't parse the date
+
+            handoffs.append({
+                'id': focus.id,
+                'target': focus.target,
+                'agent': focus.agent,
+                'name': focus.data.get('name', ''),
+                'felt_quality': focus.data.get('felt_quality'),
+                'care_at_center': focus.data.get('care_at_center'),
+                'handoff_note': note,
+                'finalized_at': focus.data.get('finalized_at'),
+            })
+
+            if len(handoffs) >= limit:
+                break
+
+        return handoffs
 
     def recover_focus(self, target_id: str, agent: str) -> Optional[Focus]:
         """

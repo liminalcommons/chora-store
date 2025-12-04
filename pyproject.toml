@@ -33,6 +33,14 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]
+mcp = [
+    "fastmcp>=0.1.0",
+    "anthropic>=0.18.0",
+]
+embeddings = [
+    "sentence-transformers>=2.2.0",
+    "numpy>=1.21.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/liminalcommons/chora"

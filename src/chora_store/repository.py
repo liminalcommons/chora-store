@@ -298,6 +298,11 @@ class EntityRepository:
         Returns:
             List of matching entities
         """
+        # Escape query for FTS: hyphens are interpreted as column operators
+        # Quote the entire query to treat it as a phrase/literal
+        # Also escape any internal quotes
+        escaped_query = '"' + query.replace('"', '""') + '"'
+
         with self._connection() as conn:
             rows = conn.execute(
                 """
@@ -307,7 +312,7 @@ class EntityRepository:
                 ORDER BY rank
                 LIMIT ?
                 """,
-                (query, limit),
+                (escaped_query, limit),
             ).fetchall()
             return [self._row_to_entity(row) for row in rows]
 

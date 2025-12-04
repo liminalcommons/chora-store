@@ -142,15 +142,23 @@ class PatternEvaluator:
         """Calculate days since pattern became experimental."""
         # Check for explicit experimental_since in data
         experimental_since = pattern.data.get("experimental_since")
+        now = datetime.now(timezone.utc)
         if experimental_since:
             try:
                 since_date = datetime.fromisoformat(experimental_since.replace("Z", "+00:00"))
-                return (datetime.utcnow() - since_date.replace(tzinfo=None)).days
+                # Ensure timezone-aware
+                if since_date.tzinfo is None:
+                    since_date = since_date.replace(tzinfo=timezone.utc)
+                return (now - since_date).days
             except (ValueError, AttributeError):
                 pass
 
         # Fall back to created_at
-        return (datetime.utcnow() - pattern.created_at).days
+        created_at = pattern.created_at
+        # Ensure timezone-aware
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return (now - created_at).days
 
     def _count_entities_with_pattern(
         self,
@@ -158,6 +166,7 @@ class PatternEvaluator:
         entity_type: str,
         status: Optional[str] = None,
         field_condition: Optional[Dict[str, Any]] = None,
+        not_null_fields: Optional[List[str]] = None,
     ) -> int:
         """
         Count entities created with a pattern's epigenetics.
@@ -167,6 +176,7 @@ class PatternEvaluator:
             entity_type: Type of entities to count
             status: Optional status filter
             field_condition: Optional dict of field=value conditions
+            not_null_fields: Fields that must be non-null and non-empty
 
         Returns:
             Count of matching entities
@@ -180,16 +190,31 @@ class PatternEvaluator:
                 if pattern_id not in epigenetics:
                     continue
 
+                match = True
+
                 # Check additional field conditions
                 if field_condition:
-                    match = True
                     for field_name, expected_value in field_condition.items():
                         actual_value = entity.data.get(field_name)
-                        if actual_value != expected_value:
+                        # IS NULL: treat empty string as null
+                        if expected_value is None:
+                            if actual_value is not None and actual_value != "":
+                                match = False
+                                break
+                        elif actual_value != expected_value:
                             match = False
                             break
-                    if not match:
-                        continue
+
+                # Check IS NOT NULL conditions
+                if match and not_null_fields:
+                    for field_name in not_null_fields:
+                        actual_value = entity.data.get(field_name)
+                        if actual_value is None or actual_value == "":
+                            match = False
+                            break
+
+                if not match:
+                    continue
 
                 count += 1
         except Exception:
@@ -259,6 +284,7 @@ class PatternEvaluator:
         query = query.strip()
 
         # Handle ratio queries: count(...) / count(...)
+        # Pattern 1: Both sides have WHERE
         ratio_match = re.match(
             r"count\((\w+)\s+WHERE\s+(.+?)\)\s*/\s*count\((\w+)\s+WHERE\s+(.+?)\)",
             query,
@@ -281,6 +307,26 @@ class PatternEvaluator:
                 return 0.0
             return numerator / denominator
 
+        # Pattern 2: Numerator has WHERE, denominator is simple count
+        ratio_simple_match = re.match(
+            r"count\((\w+)\s+WHERE\s+(.+?)\)\s*/\s*count\((\w+)\)",
+            query,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if ratio_simple_match:
+            numerator_type = ratio_simple_match.group(1)
+            numerator_conditions = ratio_simple_match.group(2)
+            denominator_type = ratio_simple_match.group(3)
+
+            numerator = self._count_with_conditions(
+                pattern_id, numerator_type, numerator_conditions
+            )
+            denominator = self._count_all(denominator_type)
+
+            if denominator == 0:
+                return 0.0
+            return numerator / denominator
+
         # Handle simple count queries: count(type WHERE ...)
         count_match = re.match(
             r"count\((\w+)\s+WHERE\s+(.+?)\)",
@@ -292,6 +338,12 @@ class PatternEvaluator:
             conditions = count_match.group(2)
             return float(self._count_with_conditions(pattern_id, entity_type, conditions))
 
+        # Handle bare count without WHERE: count(type)
+        count_bare_match = re.match(r"count\((\w+)\)$", query.strip(), re.IGNORECASE)
+        if count_bare_match:
+            entity_type = count_bare_match.group(1)
+            return float(self._count_all(entity_type))
+
         # Handle avg queries (simplified)
         avg_match = re.match(r"avg\((.+?)\)", query, re.IGNORECASE | re.DOTALL)
         if avg_match:
@@ -299,6 +351,23 @@ class PatternEvaluator:
             return None
 
         return None
+
+    def _count_all(self, entity_type_plural: str) -> int:
+        """
+        Count all entities of a given type.
+
+        Args:
+            entity_type_plural: Plural form (e.g., "features")
+
+        Returns:
+            Total count of entities of that type
+        """
+        entity_type = entity_type_plural.rstrip("s")  # features -> feature
+        try:
+            entities = self.repository.list(entity_type=entity_type, limit=1000)
+            return len(entities)
+        except Exception:
+            return 0
 
     def _count_with_conditions(
         self,
@@ -327,10 +396,10 @@ class PatternEvaluator:
             status = status_match.group(1)
 
         # Extract field IS NOT NULL
+        not_null_fields = []
         not_null_matches = re.findall(r"(\w+)\s+IS\s+NOT\s+NULL", conditions, re.IGNORECASE)
         for field_name in not_null_matches:
-            # We'll interpret IS NOT NULL as "field exists and is not empty"
-            pass  # Can't easily express this in count function
+            not_null_fields.append(field_name)
 
         # Extract field IS NULL
         null_matches = re.findall(r"(\w+)\s+IS\s+NULL", conditions, re.IGNORECASE)
@@ -349,7 +418,11 @@ class PatternEvaluator:
             field_conditions[field_name] = value.lower() == "true"
 
         return self._count_entities_with_pattern(
-            pattern_id, entity_type, status, field_conditions if field_conditions else None
+            pattern_id,
+            entity_type,
+            status,
+            field_conditions if field_conditions else None,
+            not_null_fields if not_null_fields else None,
         )
 
     def evaluate_pattern(self, pattern: Entity) -> FitnessReport:
@@ -566,6 +639,195 @@ class PatternEvaluator:
             return f"Finalized pattern: {pattern.id}"
 
         return f"Unknown action: {action}"
+
+    # =========================================================================
+    # INHERIT PHASE - Execute recommendations from SELECT
+    # =========================================================================
+
+    def execute_recommendation(self, report: FitnessReport) -> Dict[str, Any]:
+        """
+        Execute a recommendation from the SELECT phase (INHERIT).
+
+        This is the INHERIT phase - it applies the recommendation by:
+        - Transitioning pattern status for promote/deprecate
+        - Creating a learning entity capturing experiment outcomes
+        - Doing nothing for "continue" recommendations
+
+        Args:
+            report: FitnessReport from evaluate_pattern()
+
+        Returns:
+            Dict with execution results:
+            - action_taken: str ("promoted", "deprecated", "continued")
+            - pattern_status: str (new status)
+            - learning_id: Optional[str] (if learning created)
+            - details: str (human-readable summary)
+        """
+        pattern = self.repository.read(report.pattern_id)
+        if not pattern:
+            return {
+                "action_taken": "error",
+                "pattern_status": None,
+                "learning_id": None,
+                "details": f"Pattern {report.pattern_id} not found",
+            }
+
+        if report.recommendation == "continue":
+            return {
+                "action_taken": "continued",
+                "pattern_status": pattern.status,
+                "learning_id": None,
+                "details": f"Pattern {pattern.id} continues observation",
+            }
+
+        if report.recommendation == "promote":
+            return self._execute_promotion(pattern, report)
+
+        if report.recommendation == "deprecate":
+            return self._execute_deprecation(pattern, report)
+
+        return {
+            "action_taken": "error",
+            "pattern_status": pattern.status,
+            "learning_id": None,
+            "details": f"Unknown recommendation: {report.recommendation}",
+        }
+
+    def _execute_promotion(
+        self, pattern: Entity, report: FitnessReport
+    ) -> Dict[str, Any]:
+        """Execute pattern promotion to adopted status."""
+        old_status = pattern.status
+        now = datetime.now(timezone.utc)
+
+        # Update pattern status and add adoption metadata
+        updated = pattern.copy(status="adopted")
+        updated.data["adopted_at"] = now.isoformat()
+        updated.data["experimental_duration_days"] = report.days_since_experimental
+        updated.data["final_metrics"] = self._snapshot_metrics(report)
+        self.repository.update(updated)
+
+        # Emit event
+        self.observer.emit(ChangeType.UPDATED, updated, old_status=old_status)
+
+        # Create learning with experiment outcomes
+        learning_id = self._create_experiment_learning(pattern, report, "promoted")
+
+        return {
+            "action_taken": "promoted",
+            "pattern_status": "adopted",
+            "learning_id": learning_id,
+            "details": f"Pattern {pattern.id} promoted to adopted after {report.days_since_experimental} days",
+        }
+
+    def _execute_deprecation(
+        self, pattern: Entity, report: FitnessReport
+    ) -> Dict[str, Any]:
+        """Execute pattern deprecation."""
+        old_status = pattern.status
+        now = datetime.now(timezone.utc)
+
+        # Update pattern status and add deprecation metadata
+        updated = pattern.copy(status="deprecated")
+        updated.data["deprecated_at"] = now.isoformat()
+        updated.data["deprecation_reason"] = "metrics_failed"
+        updated.data["experimental_duration_days"] = report.days_since_experimental
+        updated.data["final_metrics"] = self._snapshot_metrics(report)
+        self.repository.update(updated)
+
+        # Emit event
+        self.observer.emit(ChangeType.UPDATED, updated, old_status=old_status)
+
+        # Create learning with failure analysis
+        learning_id = self._create_experiment_learning(pattern, report, "deprecated")
+
+        return {
+            "action_taken": "deprecated",
+            "pattern_status": "deprecated",
+            "learning_id": learning_id,
+            "details": f"Pattern {pattern.id} deprecated: metrics not achieved",
+        }
+
+    def _snapshot_metrics(self, report: FitnessReport) -> Dict[str, Any]:
+        """Create a snapshot of metrics for archival."""
+        return {
+            "snapshot_at": datetime.now(timezone.utc).isoformat(),
+            "observation_days": report.days_since_experimental,
+            "sample_size": f"{report.sample_size_actual}/{report.sample_size_required}",
+            "metrics": [
+                {
+                    "name": m.name,
+                    "baseline": m.baseline,
+                    "target": m.target,
+                    "final_value": m.current_value,
+                    "achieved": m.achieved,
+                }
+                for m in report.metrics
+            ],
+        }
+
+    def _create_experiment_learning(
+        self,
+        pattern: Entity,
+        report: FitnessReport,
+        outcome: str,  # "promoted" or "deprecated"
+    ) -> Optional[str]:
+        """Create a learning entity capturing experiment outcomes."""
+        try:
+            from .factory import EntityFactory
+            factory = EntityFactory(repository=self.repository)
+
+            # Build comprehensive insight
+            metrics_summary = "\n".join([
+                f"  - {m.name}: {m.current_value} (target: {m.target}, "
+                f"{'ACHIEVED' if m.achieved else 'FAILED'})"
+                for m in report.metrics
+            ])
+
+            # Count affected entities
+            target_type = pattern.data.get("mechanics", {}).get("target", "feature")
+            affected_count = self._count_entities_with_pattern(pattern.id, target_type)
+
+            conclusion = (
+                "all success conditions were met"
+                if outcome == "promoted"
+                else "failure conditions were triggered - metrics did not meet targets"
+            )
+
+            insight = f"""## Experiment Outcome: {outcome.upper()}
+
+**Pattern**: {pattern.data.get('name', pattern.id)}
+**ID**: {pattern.id}
+
+### Original Hypothesis
+{pattern.data.get('description', 'No description provided')}
+
+### Observation Period
+- Duration: {report.days_since_experimental} days (required: {report.observation_period_days})
+- Sample size: {report.sample_size_actual}/{report.sample_size_required} entities
+- Entities affected: {affected_count} {target_type}s
+
+### Metrics
+{metrics_summary}
+
+### Conclusion
+Pattern was {outcome} because {conclusion}.
+"""
+
+            learning = factory.create(
+                "learning",
+                f"Pattern {pattern.id} {outcome}: experiment concluded",
+                insight=insight.strip(),
+                domain="epigenetic-experiment",
+                links=[pattern.id],
+                impact="high",
+            )
+
+            return learning.id
+
+        except Exception as e:
+            # Log but don't fail the promotion/deprecation
+            return None
 
     def get_summary(self) -> Dict[str, Any]:
         """
@@ -967,6 +1229,122 @@ widespread damage. Review the pattern definition and consider whether:
 
         return learning_id
 
+    def auto_disable(self, alert: CanaryAlert) -> Dict[str, Any]:
+        """
+        Automatically disable a pattern based on a critical canary alert.
+
+        This is the emergency deprecation path - no observation period,
+        immediate status transition to protect the system.
+
+        Args:
+            alert: CanaryAlert with severity information
+
+        Returns:
+            Dict with execution results:
+            - action_taken: str ("disabled", "skipped")
+            - pattern_status: str (new status if changed)
+            - learning_id: Optional[str] (if learning created)
+            - details: str (human-readable summary)
+        """
+        # Only auto-disable on critical alerts
+        if alert.severity != "critical":
+            return {
+                "action_taken": "skipped",
+                "pattern_status": None,
+                "learning_id": None,
+                "details": f"Alert severity '{alert.severity}' does not require auto-disable",
+            }
+
+        pattern = self.repository.read(alert.pattern_id)
+        if not pattern:
+            return {
+                "action_taken": "error",
+                "pattern_status": None,
+                "learning_id": None,
+                "details": f"Pattern {alert.pattern_id} not found",
+            }
+
+        # Already deprecated, nothing to do
+        if pattern.status == "deprecated":
+            return {
+                "action_taken": "skipped",
+                "pattern_status": "deprecated",
+                "learning_id": None,
+                "details": "Pattern already deprecated",
+            }
+
+        old_status = pattern.status
+        now = datetime.now(timezone.utc)
+
+        # Update pattern status with full alert context
+        updated = pattern.copy(status="deprecated")
+        updated.data["disabled_by_canary"] = True
+        updated.data["disabled_at"] = now.isoformat()
+        updated.data["disabled_reason"] = alert.details
+        updated.data["canary_signal"] = alert.signal
+        updated.data["canary_severity"] = alert.severity
+        self.repository.update(updated)
+
+        # Emit event
+        self.observer.emit(ChangeType.UPDATED, updated, old_status=old_status)
+
+        # Mark alert as handled
+        alert.auto_disabled = True
+
+        # Create learning with alert details
+        learning_id = self._create_canary_learning(pattern, alert)
+
+        return {
+            "action_taken": "disabled",
+            "pattern_status": "deprecated",
+            "learning_id": learning_id,
+            "alert_signal": alert.signal,
+            "details": f"Pattern {pattern.id} emergency-disabled: {alert.details}",
+        }
+
+    def _create_canary_learning(
+        self, pattern: Entity, alert: CanaryAlert
+    ) -> Optional[str]:
+        """Create a learning entity capturing canary alert details."""
+        try:
+            from .factory import EntityFactory
+            factory = EntityFactory(repository=self.repository)
+
+            insight = f"""## Canary Alert: Pattern Emergency Disabled
+
+**Pattern**: {pattern.data.get('name', pattern.id)}
+**ID**: {pattern.id}
+
+### Alert Details
+- Signal: {alert.signal}
+- Severity: {alert.severity}
+- Detected at: {alert.detected_at.isoformat()}
+
+### Reason
+{alert.details}
+
+### Action Taken
+Pattern was automatically disabled to prevent further harm.
+This is a safety mechanism - review the pattern definition and consider:
+1. Whether the pattern's hooks are too aggressive
+2. If the fitness criteria are misconfigured
+3. Whether the pattern should be deprecated permanently
+"""
+
+            learning = factory.create(
+                "learning",
+                f"Canary disabled pattern {pattern.id}: {alert.signal}",
+                insight=insight.strip(),
+                domain="epigenetic-canary",
+                links=[pattern.id],
+                impact="high",
+            )
+
+            return learning.id
+
+        except Exception:
+            return None
+
     def get_summary(self) -> Dict[str, Any]:
         """
         Get summary of canary status for all patterns.
@@ -1015,7 +1393,17 @@ INDUCTION_THRESHOLDS = {
     "min_learnings": 3,          # Minimum learnings to propose pattern
     "confidence_threshold": 0.6,  # Minimum confidence to show proposal
     "max_proposals": 3,           # Maximum proposals per check
-    "keyword_overlap": 0.3,       # Minimum keyword overlap for clustering
+    "keyword_overlap": 0.05,      # Legacy Jaccard threshold (fallback)
+    "embedding_similarity": 0.70, # Cosine similarity threshold for embeddings
+}
+
+# Cross-domain thresholds (Experiment 4: Cross-Domain Pollination)
+CROSS_DOMAIN_THRESHOLDS = {
+    "min_domains": 2,              # Minimum domains to bridge
+    "embedding_similarity": 0.85,  # Higher bar than within-domain (0.70)
+    "min_learnings_per_domain": 1, # At least 1 learning per domain
+    "min_total_learnings": 3,      # Minimum learnings total
+    "confidence_boost": 0.1,       # Bonus confidence for cross-domain
 }
 
 
@@ -1031,6 +1419,10 @@ class PatternProposal:
     suggested_target: str  # Entity type this pattern would target
     suggested_fields: Dict[str, Any]  # Fields to inject
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Cross-domain support (Experiment 4)
+    cross_domain: bool = False  # Is this a bridge pattern?
+    source_domains: List[str] = field(default_factory=list)  # Domains this bridges
+    bridge_strength: float = 0.0  # Semantic similarity across domains
 
 
 class PatternInductor:
@@ -1041,7 +1433,7 @@ class PatternInductor:
     - System analyzes learnings → System proposes mutation → Human approves
 
     The inductor:
-    1. Clusters learnings by domain and keyword similarity
+    1. Clusters learnings by domain and semantic similarity (embeddings)
     2. Identifies clusters with recurring themes (>= 3 learnings)
     3. Synthesizes pattern proposals from clusters
     4. Presents proposals with confidence scores
@@ -1069,6 +1461,28 @@ class PatternInductor:
         """
         self.repository = repository
         self.thresholds = thresholds or INDUCTION_THRESHOLDS.copy()
+        self._embedding_service = None  # Lazy-loaded
+        self._embeddings_available = None  # Cached availability check
+
+    @property
+    def embedding_service(self):
+        """Lazy-load the embedding service if available."""
+        if self._embedding_service is None and self._embeddings_available is not False:
+            try:
+                from .embeddings import EmbeddingService
+                self._embedding_service = EmbeddingService(self.repository.db_path)
+                self._embeddings_available = True
+            except ImportError:
+                self._embeddings_available = False
+        return self._embedding_service
+
+    @property
+    def embeddings_available(self) -> bool:
+        """Check if embeddings are available."""
+        if self._embeddings_available is None:
+            # Trigger lazy load attempt
+            _ = self.embedding_service
+        return self._embeddings_available or False
 
     def _load_learnings(self, status: Optional[str] = None) -> List[Entity]:
         """Load learnings from repository."""
@@ -1112,7 +1526,7 @@ class PatternInductor:
     def _calculate_keyword_overlap(
         self, keywords1: List[str], keywords2: List[str]
     ) -> float:
-        """Calculate Jaccard similarity between keyword sets."""
+        """Calculate Jaccard similarity between keyword sets (fallback method)."""
         if not keywords1 or not keywords2:
             return 0.0
 
@@ -1124,9 +1538,48 @@ class PatternInductor:
 
         return intersection / union if union > 0 else 0.0
 
+    def _calculate_semantic_similarity(
+        self, entity1: Entity, entity2: Entity
+    ) -> float:
+        """
+        Calculate semantic similarity between entities using embeddings.
+
+        Falls back to Jaccard keyword overlap if embeddings unavailable.
+
+        Args:
+            entity1: First entity
+            entity2: Second entity
+
+        Returns:
+            Similarity score (0.0 to 1.0)
+        """
+        if self.embeddings_available:
+            try:
+                emb1 = self.embedding_service.get_or_create_embedding(entity1)
+                emb2 = self.embedding_service.get_or_create_embedding(entity2)
+                return self.embedding_service.cosine_similarity(emb1, emb2)
+            except Exception:
+                pass  # Fall back to Jaccard
+
+        # Fallback: Jaccard keyword overlap
+        text1 = f"{entity1.data.get('name', '')} {entity1.data.get('insight', '')}"
+        text2 = f"{entity2.data.get('name', '')} {entity2.data.get('insight', '')}"
+        keywords1 = self._extract_keywords(text1)
+        keywords2 = self._extract_keywords(text2)
+        return self._calculate_keyword_overlap(keywords1, keywords2)
+
+    def _get_similarity_threshold(self) -> float:
+        """Get the appropriate similarity threshold based on available method."""
+        if self.embeddings_available:
+            return self.thresholds.get("embedding_similarity", 0.70)
+        return self.thresholds.get("keyword_overlap", 0.05)
+
     def _cluster_learnings(self) -> Dict[str, List[Entity]]:
         """
-        Cluster learnings by domain and keyword similarity.
+        Cluster learnings by domain and semantic similarity.
+
+        Uses vector embeddings when available for more accurate semantic
+        clustering. Falls back to Jaccard keyword overlap otherwise.
 
         Returns:
             Dict mapping cluster key to list of learnings
@@ -1136,16 +1589,15 @@ class PatternInductor:
 
         for learning in learnings:
             domain = learning.data.get("domain", "general")
-            insight = learning.data.get("insight", "")
-            name = learning.data.get("name", "")
 
             # Primary clustering by domain
             if domain not in clusters:
                 clusters[domain] = []
             clusters[domain].append(learning)
 
-        # Secondary clustering within domains by keyword similarity
+        # Secondary clustering within domains by semantic similarity
         refined_clusters: Dict[str, List[Entity]] = {}
+        similarity_threshold = self._get_similarity_threshold()
 
         for domain, domain_learnings in clusters.items():
             if len(domain_learnings) < self.thresholds["min_learnings"]:
@@ -1153,13 +1605,15 @@ class PatternInductor:
                 refined_clusters[domain] = domain_learnings
                 continue
 
-            # Extract keywords for each learning
-            learning_keywords = {}
-            for l in domain_learnings:
-                text = f"{l.data.get('name', '')} {l.data.get('insight', '')}"
-                learning_keywords[l.id] = self._extract_keywords(text)
+            # Use embeddings for batch efficiency if available
+            if self.embeddings_available:
+                try:
+                    # Batch compute embeddings for efficiency
+                    self.embedding_service.batch_embed_entities(domain_learnings)
+                except Exception:
+                    pass  # Will fall back to per-pair calculation
 
-            # Simple clustering: group learnings with overlapping keywords
+            # Simple greedy clustering: group learnings with semantic similarity
             used = set()
             cluster_idx = 0
 
@@ -1171,17 +1625,14 @@ class PatternInductor:
                 refined_clusters[cluster_key] = [learning]
                 used.add(learning.id)
 
-                # Find similar learnings
+                # Find semantically similar learnings
                 for other in domain_learnings:
                     if other.id in used:
                         continue
 
-                    overlap = self._calculate_keyword_overlap(
-                        learning_keywords[learning.id],
-                        learning_keywords[other.id]
-                    )
+                    similarity = self._calculate_semantic_similarity(learning, other)
 
-                    if overlap >= self.thresholds["keyword_overlap"]:
+                    if similarity >= similarity_threshold:
                         refined_clusters[cluster_key].append(other)
                         used.add(other.id)
 
@@ -1286,8 +1737,7 @@ class PatternInductor:
 
         Factors:
         - Number of learnings (more = higher confidence)
-        - Keyword overlap (higher = more coherent)
-        - Recency (recent learnings = higher relevance)
+        - Semantic coherence (higher = more related)
         """
         if not learnings:
             return 0.0
@@ -1296,19 +1746,15 @@ class PatternInductor:
         min_learnings = self.thresholds["min_learnings"]
         count_factor = min(len(learnings) / (min_learnings * 2), 1.0)
 
-        # Keyword coherence factor
+        # Semantic coherence factor
         if len(learnings) >= 2:
-            total_overlap = 0.0
+            total_similarity = 0.0
             comparisons = 0
             for i, l1 in enumerate(learnings):
                 for l2 in learnings[i + 1:]:
-                    text1 = f"{l1.data.get('name', '')} {l1.data.get('insight', '')}"
-                    text2 = f"{l2.data.get('name', '')} {l2.data.get('insight', '')}"
-                    keywords1 = self._extract_keywords(text1)
-                    keywords2 = self._extract_keywords(text2)
-                    total_overlap += self._calculate_keyword_overlap(keywords1, keywords2)
+                    total_similarity += self._calculate_semantic_similarity(l1, l2)
                     comparisons += 1
-            coherence_factor = total_overlap / comparisons if comparisons > 0 else 0.0
+            coherence_factor = total_similarity / comparisons if comparisons > 0 else 0.0
         else:
             coherence_factor = 0.5
 
@@ -1317,9 +1763,13 @@ class PatternInductor:
 
         return min(confidence, 1.0)
 
-    def analyze(self) -> List[PatternProposal]:
+    def analyze(self, include_cross_domain: bool = False) -> List[PatternProposal]:
         """
         Analyze learnings and generate pattern proposals.
+
+        Args:
+            include_cross_domain: If True, also detect cross-domain bridges
+                                  (Experiment 4: Cross-Domain Pollination)
 
         Returns:
             List of pattern proposals sorted by confidence
@@ -1332,11 +1782,186 @@ class PatternInductor:
             if proposal and proposal.confidence >= self.thresholds["confidence_threshold"]:
                 proposals.append(proposal)
 
+        # Cross-domain proposals (opt-in)
+        if include_cross_domain:
+            cross_domain_proposals = self._detect_cross_domain_bridges(clusters)
+            proposals.extend(cross_domain_proposals)
+
         # Sort by confidence and limit
         proposals.sort(key=lambda p: p.confidence, reverse=True)
         max_proposals = self.thresholds["max_proposals"]
 
         return proposals[:max_proposals]
+
+    def _detect_cross_domain_bridges(
+        self, domain_clusters: Dict[str, List[Entity]]
+    ) -> List[PatternProposal]:
+        """
+        Detect bridge opportunities across domain boundaries.
+
+        Algorithm:
+        1. Group clusters by their primary domain
+        2. Compare representative learnings across domains using embeddings
+        3. When similarity exceeds threshold, generate cross-domain proposal
+        4. Mark proposals with cross_domain=True
+
+        Args:
+            domain_clusters: Dict of cluster_key -> learnings (from _cluster_learnings)
+
+        Returns:
+            List of cross-domain PatternProposals
+        """
+        # Check for configurable cross_domain_similarity in thresholds
+        if "cross_domain_similarity" in self.thresholds:
+            cross_threshold = self.thresholds["cross_domain_similarity"]
+        elif self.embeddings_available:
+            cross_threshold = CROSS_DOMAIN_THRESHOLDS["embedding_similarity"]
+        else:
+            cross_threshold = 0.3  # Lower threshold for keyword-based fallback
+
+        min_learnings = CROSS_DOMAIN_THRESHOLDS["min_total_learnings"]
+
+        # Group clusters by primary domain (domain_0 -> domain)
+        domain_groups: Dict[str, List[Entity]] = {}
+        for cluster_key, learnings in domain_clusters.items():
+            # Extract primary domain from cluster key (e.g., "testing_0" -> "testing")
+            primary_domain = cluster_key.split("_")[0] if "_" in cluster_key else cluster_key
+            if primary_domain not in domain_groups:
+                domain_groups[primary_domain] = []
+            domain_groups[primary_domain].extend(learnings)
+
+        # Need at least 2 domains for cross-domain
+        domains = list(domain_groups.keys())
+        if len(domains) < 2:
+            return []
+
+        # Collect domain representatives (first learning from each domain)
+        domain_reps: Dict[str, Entity] = {}
+        for domain, learnings in domain_groups.items():
+            if learnings:
+                domain_reps[domain] = learnings[0]
+
+        # Find bridge candidates by comparing domain representatives
+        bridges: List[PatternProposal] = []
+        checked_pairs: set = set()
+
+        for i, domain_a in enumerate(domains):
+            for domain_b in domains[i + 1:]:
+                pair_key = tuple(sorted([domain_a, domain_b]))
+                if pair_key in checked_pairs:
+                    continue
+                checked_pairs.add(pair_key)
+
+                rep_a = domain_reps.get(domain_a)
+                rep_b = domain_reps.get(domain_b)
+                if not rep_a or not rep_b:
+                    continue
+
+                # Calculate cross-domain similarity
+                similarity = self._calculate_semantic_similarity(rep_a, rep_b)
+
+                if similarity >= cross_threshold:
+                    # Combine learnings from both domains
+                    bridge_learnings = (
+                        domain_groups[domain_a][:5] +
+                        domain_groups[domain_b][:5]
+                    )
+
+                    if len(bridge_learnings) >= min_learnings:
+                        proposal = self._generate_cross_domain_proposal(
+                            domains=[domain_a, domain_b],
+                            learnings=bridge_learnings,
+                            bridge_strength=similarity,
+                        )
+                        if proposal:
+                            bridges.append(proposal)
+
+        return bridges
+
+    def _generate_cross_domain_proposal(
+        self,
+        domains: List[str],
+        learnings: List[Entity],
+        bridge_strength: float,
+    ) -> Optional[PatternProposal]:
+        """Generate a cross-domain pattern proposal."""
+        if len(learnings) < CROSS_DOMAIN_THRESHOLDS["min_total_learnings"]:
+            return None
+
+        domain_str = " + ".join(sorted(domains)[:3])
+
+        # Extract insights from learnings
+        insights = [l.data.get("insight", "") for l in learnings if l.data.get("insight")]
+        combined_insight = " ".join(insights[:3])[:500]
+
+        # Find common theme from learning names
+        names = [l.data.get("name", "") for l in learnings]
+        common_words = self._find_common_words(names)
+        common_theme = " ".join(common_words[:3]) if common_words else "shared pattern"
+
+        proposed_name = f"Bridge pattern ({domain_str}): {common_theme}"
+
+        # Calculate confidence with boost for cross-domain
+        base_confidence = self._calculate_confidence(learnings)
+        confidence_boost = CROSS_DOMAIN_THRESHOLDS.get("confidence_boost", 0.1)
+        confidence = min(base_confidence + confidence_boost, 1.0)
+
+        # Generate slug and ID
+        import re
+        slug = re.sub(r'[^a-z0-9]+', '-', proposed_name.lower()).strip('-')[:40]
+        pattern_id = f"pattern-bridge-{slug}"
+
+        return PatternProposal(
+            id=pattern_id,
+            name=proposed_name,
+            description=combined_insight,
+            source_learnings=[l.id for l in learnings],
+            domain=domains[0],  # Primary domain
+            confidence=confidence,
+            suggested_target="feature",
+            suggested_fields={},
+            cross_domain=True,
+            source_domains=sorted(domains),
+            bridge_strength=bridge_strength,
+        )
+
+    def _find_common_words(self, texts: List[str]) -> List[str]:
+        """Find common words across multiple texts."""
+        if not texts:
+            return []
+
+        # Simple common word extraction
+        word_counts: Dict[str, int] = {}
+        stopwords = {"the", "a", "an", "is", "are", "in", "on", "for", "to", "of", "and", "about"}
+
+        for text in texts:
+            words = set(text.lower().split())
+            for word in words:
+                if word not in stopwords and len(word) > 2:
+                    word_counts[word] = word_counts.get(word, 0) + 1
+
+        # Return words that appear in at least half the texts
+        threshold = len(texts) / 2
+        common = [word for word, count in word_counts.items() if count >= threshold]
+        return sorted(common, key=lambda w: word_counts[w], reverse=True)
+
+    def _get_current_loop_generation(self) -> int:
+        """
+        Determine the current loop generation.
+
+        Generation 1: Manually created or first-wave induced patterns
+        Generation N+1: Patterns induced from learnings about generation N patterns
+        """
+        max_gen = 0
+        try:
+            patterns = self.repository.list(entity_type="pattern", limit=100)
+            for p in patterns:
+                gen = p.data.get("loop_generation", 0)
+                if isinstance(gen, int) and gen > max_gen:
+                    max_gen = gen
+        except Exception:
+            pass
+        return max(max_gen, 1)  # At least generation 1
 
     def approve_proposal(self, proposal: PatternProposal) -> Optional[Entity]:
         """
@@ -1351,13 +1976,24 @@ class PatternInductor:
         from .factory import EntityFactory
         factory = EntityFactory(repository=self.repository)
 
+        # Determine loop generation for meta-tracking
+        current_generation = self._get_current_loop_generation()
+        induced_from_count = len(proposal.source_learnings)
+
+        # Build context description
+        if proposal.cross_domain:
+            domain_str = " + ".join(proposal.source_domains)
+            context_desc = f"Cross-domain bridge from {induced_from_count} learnings spanning '{domain_str}'"
+        else:
+            context_desc = f"Induced from {induced_from_count} learnings in domain '{proposal.domain}'"
+
         # Create the pattern - don't pass status, let factory use default
         pattern = factory.create(
             "pattern",
             proposal.name,
             description=proposal.description,
             subtype="schema-extension",
-            context=f"Induced from {len(proposal.source_learnings)} learnings in domain '{proposal.domain}'",
+            context=context_desc,
             problem=f"Multiple learnings suggest a pattern opportunity",
             solution=proposal.description,
             mechanics={
@@ -1372,6 +2008,13 @@ class PatternInductor:
             },
             induced_from=proposal.source_learnings,
             induction_confidence=proposal.confidence,
+            # Meta-loop tracking fields (Experiment 2)
+            loop_generation=current_generation,
+            induced_from_count=induced_from_count,
+            # Cross-domain tracking fields (Experiment 4)
+            cross_domain=proposal.cross_domain,
+            source_domains=proposal.source_domains if proposal.cross_domain else [],
+            bridge_strength=proposal.bridge_strength if proposal.cross_domain else 0.0,
         )
 
         # Mark source learnings as applied
