@@ -1,171 +1,147 @@
-# chora-store: Agent Awareness
+# chora-store
 
-**Package**: chora-store
-**Type**: SQLite Entity Store + Physics Engine
-**Purpose**: Persist and validate entities with Structural Governance
+**The Engine**
 
----
-
-## What Is This?
-
-This is the **Physics Engine** - the enforcement point for Structural Governance. Invalid entities cannot exist because this package won't create them.
-
-## Key Classes
-
-| Class | Purpose | Autopoietic Pillar |
-|-------|---------|-------------------|
-| `EntityFactory` | Create/validate entities | Structural Governance |
-| `EntityRepository` | SQLite persistence | - |
-| `EntityObserver` | Event emission | Stigmergic Coordination |
-| `Entity` | Data model | - |
+This package implements the tensegrity physics defined in `chora-kernel`.
 
 ---
 
-## Creating Entities (Use Factory, Not Repository)
+## Architecture
 
-**IMPORTANT**: Always use `EntityFactory` to create entities. Direct `EntityRepository` access bypasses validation.
-
-```python
-from chora_store import EntityFactory
-
-# Create factory with kernel path
-factory = EntityFactory(kernel_path="packages/chora-kernel")
-
-# Create entity (validated)
-entity = factory.create("feature", "Voice Canvas")
-
-# Factory handles:
-# 1. Type validation (must be in kernel)
-# 2. Semantic ID generation
-# 3. Status validation
-# 4. Required field validation
-# 5. Persistence
-# 6. Event emission
+```
+src/chora_store/
+├── models.py       # Entity dataclass
+├── repository.py   # SQLite persistence
+├── physics.py      # Tensegrity computation
+├── dynamics/       # The 4 Canonical Operators
+│   ├── manifest.py    # MANIFEST: Create Matter
+│   ├── bond.py        # BOND: Create Force
+│   ├── transmute.py   # TRANSMUTE: Change State
+│   └── sense.py       # SENSE: Read Network
+├── cli.py          # Command-line interface
+└── mcp.py          # MCP tool handlers
 ```
 
-## Validation Rules
+---
 
-The factory validates against `chora-kernel/standards/entity.yaml`:
+## The 4 Dynamics
 
-| Validation | Description | Error |
-|------------|-------------|-------|
-| Type exists | Entity type must be in schema | `InvalidEntityType` |
-| Status valid | Status must be valid for type | `ValidationError` |
-| Required fields | All required fields present | `ValidationError` |
-| ID unique | No duplicate IDs | `ValidationError` |
-| Slug non-empty | Title must produce valid slug | `ValidationError` |
+| Dynamic | Description | Command | Module |
+|---------|-------------|---------|--------|
+| **SENSE** | Read the tension network | `just orient`, `just constellation <id>` | `dynamics/sense.py` |
+| **MANIFEST** | Create entity from Eidos | `just create <type> <title>` | `dynamics/manifest.py` |
+| **BOND** | Create force between entities | `just bond <verb> <from> <to>` | `dynamics/bond.py` |
+| **TRANSMUTE** | Convert state or form | `just transmute <id> <op>` | `dynamics/transmute.py` |
 
 ---
 
-## Common Operations
+## Physics Laws
 
-### Create Entity
-```python
-entity = factory.create(
-    "feature",              # Type
-    "Voice Canvas",         # Title (becomes slug)
-    status="planned",       # Optional (uses default)
-    description="..."       # Additional data
+1. **Stability is computed, not declared**
+   - A behavior is "stable" only if ALL verifies bonds are active
+   - A behavior is "drifting" if ANY verifies bond is stressed
+   - A behavior is "floating" if it has no verifies bonds
+
+2. **Tension is transitive**
+   - Stories feel the stability of their specified Behaviors
+   - Drift propagates upward through the graph
+
+3. **Bond types enforce physics**
+   - `yields`: inquiry → learning
+   - `surfaces`: learning → principle
+   - `clarifies`: principle → story
+   - `specifies`: story → behavior
+   - `implements`: behavior → tool
+   - `verifies`: tool → behavior (critical tension)
+   - `crystallized-from`: any → any (provenance)
+
+---
+
+## Database
+
+**Location:** `~/.chora/chora.db`
+
+Single `entities` table with virtual columns for graph traversal:
+
+```sql
+CREATE TABLE entities (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    title TEXT NOT NULL,
+    data TEXT NOT NULL DEFAULT '{}',  -- JSON blob
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    -- Virtual columns for graph queries
+    rel_from TEXT GENERATED ALWAYS AS (json_extract(data, '$.from_id')) VIRTUAL,
+    rel_to TEXT GENERATED ALWAYS AS (json_extract(data, '$.to_id')) VIRTUAL,
+    rel_type TEXT GENERATED ALWAYS AS (json_extract(data, '$.relationship_type')) VIRTUAL
 )
 ```
 
-### Update Entity
-```python
-factory.update(entity.id, status="in_progress")
-factory.update(entity.id, description="Updated description")
-```
+---
 
-### Get Entity
-```python
-entity = factory.get("feature-voice-canvas")
-```
+## Debugging
 
-### List Entities
-```python
-# All entities
-all_entities = factory.list()
+```bash
+# Show database location
+just db
 
-# Filter by type
-features = factory.list(entity_type="feature")
+# Direct database access
+sqlite3 ~/.chora/chora.db
 
-# Filter by status
-active = factory.list(status="in_progress")
-```
+# Common queries
+sqlite3 ~/.chora/chora.db "SELECT id, type, status FROM entities"
+sqlite3 ~/.chora/chora.db "SELECT * FROM entities WHERE type='relationship'"
 
-### Search
-```python
-results = factory.search("voice")
-```
-
-### Delete
-```python
-factory.delete("feature-voice-canvas")
+# Reset (destroys all data)
+just reset
 ```
 
 ---
 
-## Observing Changes (Stigmergic Coordination)
+## Extension Points
 
-Register callbacks to react to entity changes:
+These patterns are designed but not yet implemented. Future work could:
 
-```python
-from chora_store import get_observer, ChangeType
+1. **Focus Lifecycle** (`dynamics/focus.py`)
+   - Formal declaration of attention
+   - TTL-based unlocking
+   - Trail harvesting on finalization
+   - Reference: `archive/v3/chora-store/src/chora_store/focus.py`
 
-observer = get_observer()
+2. **Handoffs**
+   - `handoff_note` field on focus entities
+   - Query for previous dweller's notes
+   - `just handoffs` command
 
-def handle_change(event):
-    if event.change_type == ChangeType.CREATED:
-        print(f"New entity: {event.entity_id}")
-    elif event.change_type == ChangeType.UPDATED:
-        print(f"Updated: {event.entity_id}, {event.old_status} → {event.new_status}")
+3. **Aliveness Fields**
+   - `felt_quality`: qualitative experience marker
+   - `care_at_center`: care/intention marker
+   - Add to focus optional fields in kernel schema
 
-observer.on_change(handle_change)
+---
+
+## Usage
+
+```bash
+# Orient yourself
+just orient
+
+# Create entities
+just create inquiry "Why does this matter?"
+just create story "User can authenticate"
+
+# Create bonds
+just yields inquiry-why-does-this-matter learning-it-matters-because
+
+# View constellation
+just constellation inquiry-why-does-this-matter
+
+# See gaps
+just voids
 ```
 
 ---
 
-## Database Location
-
-Default: `~/.chora/chora.db`
-
-Can be customized:
-```python
-from chora_store import EntityRepository, EntityFactory
-
-repo = EntityRepository(db_path="/path/to/custom.db")
-factory = EntityFactory(kernel_path="...", repository=repo)
-```
-
----
-
-## Error Handling
-
-```python
-from chora_store import ValidationError, InvalidEntityType
-
-try:
-    factory.create("invalid_type", "Test")
-except InvalidEntityType as e:
-    print(f"Unknown type: {e}")
-
-try:
-    factory.create("feature", "Test", status="invalid_status")
-except ValidationError as e:
-    print(f"Validation failed: {e}")
-```
-
----
-
-## The Physics Engine Principle
-
-**Invalid states cannot exist.**
-
-This is enforced at two levels:
-1. **Factory validation** - Python code checks against kernel
-2. **SQLite CHECK constraints** - Database rejects invalid data
-
-If validation fails at either level, the entity is not created.
-
----
-
-*The ground is solid. You can build here.*
+*The engine runs the physics. You are the force.*

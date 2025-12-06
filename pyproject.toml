@@ -5,52 +5,27 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "chora-store"
 version = "0.1.0"
-description = "SQLite entity store with Physics Engine validation for chora workspaces"
-readme = "README.md"
-license = {text = "MIT"}
-requires-python = ">=3.9"
-authors = [
-    {name = "Liminal Commons", email = "dev@liminalcommons.com"}
-]
-keywords = ["chora", "entity", "sqlite", "local-first", "agent"]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-]
-
+description = "Canonical Tensegrity Physics Engine (v4.0)"
+requires-python = ">=3.10"
 dependencies = [
-    "pyyaml>=6.0",
+    "fastmcp",
+    "pyyaml"
 ]
 
 [project.optional-dependencies]
-dev = [
+postgres = [
+    "psycopg[binary,pool]>=3.0",
+]
+test = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
 ]
-mcp = [
-    "fastmcp>=0.1.0",
-    "anthropic>=0.18.0",
-]
-embeddings = [
-    "sentence-transformers>=2.2.0",
-    "numpy>=1.21.0",
+dev = [
+    "chora-store[postgres,test]",
 ]
 
-[project.urls]
-Homepage = "https://github.com/liminalcommons/chora"
-Repository = "https://github.com/liminalcommons/chora"
+[project.scripts]
+chora = "chora_store.mcp:mcp.run"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-python_functions = ["test_*"]
-addopts = "-v"

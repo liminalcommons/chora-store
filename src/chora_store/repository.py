@@ -1,364 +1,452 @@
 """
-EntityRepository - SQLite persistence layer.
+Repository - The Memory.
 
-This is the storage layer. It handles CRUD operations against SQLite.
-The EntityFactory should be used for creating entities (with validation).
-Direct repository access bypasses the Physics Engine.
+Persists Entities and Relations in a unified graph store.
+Supports both SQLite (local-first) and PostgreSQL (cloud) backends.
 """
 
-import sqlite3
 import json
-from datetime import datetime
-from pathlib import Path
-from typing import List, Optional, Tuple
-from contextlib import contextmanager
+import uuid
+from datetime import datetime, timezone
+from typing import List, Optional, Any
 
-from .models import Entity, ValidationError
-from .schema import get_all_schema_sql
+from .models import Entity
+from .backends import create_adapter, BackendAdapter
 
 
-class EntityRepository:
+class Repository:
     """
-    SQLite-based entity repository.
+    The Memory.
+    Persists Entities and Relations in a unified graph store.
 
-    Provides CRUD operations and search capabilities.
+    Supports both SQLite and PostgreSQL backends via the BackendAdapter protocol.
+    Default behavior (SQLite) is unchanged for backwards compatibility.
     """
 
-    def __init__(self, db_path: str = "~/.chora/chora.db"):
+    def __init__(
+        self,
+        db_path: str = None,
+        adapter: BackendAdapter = None,
+        backend: str = None,
+        **kwargs,
+    ):
         """
-        Initialize repository with database path.
+        Initialize repository.
 
         Args:
-            db_path: Path to SQLite database file. Defaults to ~/.chora/chora.db
+            db_path: Path to SQLite database (backwards compatibility).
+                     Ignored if adapter is provided.
+            adapter: Pre-configured BackendAdapter instance.
+            backend: Backend type ('sqlite' or 'postgres').
+                     Used with create_adapter if adapter not provided.
+            **kwargs: Additional arguments for create_adapter.
+
+        Examples:
+            # Default SQLite (backwards compatible)
+            repo = Repository()
+
+            # SQLite with custom path (backwards compatible)
+            repo = Repository(db_path="/tmp/test.db")
+
+            # SQLite with explicit adapter
+            repo = Repository(adapter=SQLiteAdapter(db_path="/tmp/test.db"))
+
+            # PostgreSQL
+            repo = Repository(backend='postgres', dsn='postgresql://localhost/chora')
+
+            # Pre-configured adapter
+            adapter = PostgresAdapter(dsn='...')
+            repo = Repository(adapter=adapter)
         """
-        self.db_path = Path(db_path).expanduser()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if adapter is not None:
+            self._adapter = adapter
+        elif db_path is not None:
+            # Backwards compatibility: db_path implies SQLite
+            self._adapter = create_adapter('sqlite', db_path=db_path, **kwargs)
+        else:
+            # Use factory with optional backend override
+            self._adapter = create_adapter(backend=backend, **kwargs)
+
         self._init_db()
+
+    @property
+    def db_path(self) -> Optional[str]:
+        """
+        Get the database path (SQLite only, for backwards compatibility).
+
+        Returns:
+            Path string for SQLite, None for other backends.
+        """
+        if hasattr(self._adapter, 'db_path'):
+            return str(self._adapter.db_path)
+        return None
 
     def _init_db(self):
         """Initialize database schema."""
-        with self._connection() as conn:
-            conn.executescript(get_all_schema_sql())
+        with self._adapter.connection() as conn:
+            schema_sql = self._adapter.get_schema_sql()
+            self._adapter.executescript(conn, schema_sql)
 
-    @contextmanager
-    def _connection(self):
-        """Context manager for database connections."""
-        conn = sqlite3.connect(str(self.db_path))
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+    # ═══════════════════════════════════════════════════════════════════════════
+    # CRUD OPERATIONS
+    # ═══════════════════════════════════════════════════════════════════════════
 
-    def create(self, entity: Entity) -> Entity:
+    def save(self, entity: Entity) -> Entity:
         """
-        Create a new entity.
+        Persist Matter.
 
-        Args:
-            entity: Entity to create
-
-        Returns:
-            Created entity with version 1
-
-        Raises:
-            ValidationError: If entity with same ID already exists
+        Creates or updates an entity with optimistic locking (version tracking).
         """
-        with self._connection() as conn:
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO entities (id, type, status, data, version, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        entity.id,
-                        entity.type,
-                        entity.status,
-                        json.dumps(entity.data),
-                        1,
-                        entity.created_at.isoformat(),
-                        entity.updated_at.isoformat(),
-                    ),
-                )
-                # Record version for sync
-                conn.execute(
-                    """
-                    INSERT INTO entity_versions (id, entity_id, version, change_type, changed_at, data_snapshot)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        f"{entity.id}:1",
-                        entity.id,
-                        1,
-                        "create",
-                        datetime.utcnow().isoformat(),
-                        json.dumps(entity.to_dict()),
-                    ),
-                )
-            except sqlite3.IntegrityError as e:
-                if "UNIQUE constraint failed" in str(e):
-                    raise ValidationError(f"Entity '{entity.id}' already exists")
-                elif "CHECK constraint failed" in str(e):
-                    raise ValidationError(f"Entity violates schema constraints: {e}")
-                raise
-
-        return entity.copy(version=1)
-
-    def read(self, entity_id: str) -> Optional[Entity]:
-        """
-        Read an entity by ID.
-
-        Args:
-            entity_id: Entity ID to read
-
-        Returns:
-            Entity if found, None otherwise
-        """
-        with self._connection() as conn:
-            row = conn.execute(
-                "SELECT * FROM entities WHERE id = ?",
-                (entity_id,)
-            ).fetchone()
-
-            if row is None:
-                return None
-
-            return self._row_to_entity(row)
-
-    def update(self, entity: Entity) -> Entity:
-        """
-        Update an existing entity.
-
-        Uses optimistic concurrency - fails if version doesn't match.
-
-        Args:
-            entity: Entity with changes to save
-
-        Returns:
-            Updated entity with incremented version
-
-        Raises:
-            ValidationError: If entity not found or version conflict
-        """
-        new_version = entity.version + 1
-        now = datetime.utcnow()
-
-        with self._connection() as conn:
-            result = conn.execute(
-                """
-                UPDATE entities
-                SET status = ?, data = ?, version = ?, updated_at = ?
-                WHERE id = ? AND version = ?
-                """,
-                (
-                    entity.status,
-                    json.dumps(entity.data),
-                    new_version,
-                    now.isoformat(),
-                    entity.id,
-                    entity.version,
-                ),
+        p = self._adapter.param
+        with self._adapter.connection() as conn:
+            # Check if entity exists for version tracking
+            cursor = self._adapter.execute(
+                conn,
+                f"SELECT version FROM entities WHERE id = {p}",
+                (entity.id,)
             )
+            existing = self._adapter.fetchone(cursor)
 
-            if result.rowcount == 0:
-                existing = self.read(entity.id)
-                if existing is None:
-                    raise ValidationError(f"Entity '{entity.id}' not found")
-                else:
-                    raise ValidationError(
-                        f"Version conflict: expected {entity.version}, got {existing.version}"
+            if existing:
+                # Update with version increment
+                new_version = existing['version'] + 1
+                sql = f"""
+                    UPDATE entities
+                    SET type = {p}, status = {p}, title = {p}, data = {p},
+                        version = {p}, updated_at = {p}
+                    WHERE id = {p} AND version = {p}
+                """
+                cursor = self._adapter.execute(
+                    conn, sql,
+                    (
+                        entity.type, entity.status, entity.title,
+                        json.dumps(entity.data), new_version,
+                        entity.updated_at.isoformat(), entity.id, existing['version']
                     )
+                )
+                if self._adapter.rowcount(cursor) == 0:
+                    raise ValueError(f"Version conflict: entity {entity.id} was modified concurrently")
 
-            # Record version for sync
-            updated_entity = entity.copy(version=new_version, updated_at=now)
-            conn.execute(
+                # Log version change
+                self._log_version(conn, entity.id, new_version, 'update', entity.data)
+            else:
+                # Insert new entity
+                sql = f"""
+                    INSERT INTO entities (id, type, status, title, data, version, created_at, updated_at)
+                    VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p}, {p})
                 """
-                INSERT INTO entity_versions (id, entity_id, version, change_type, changed_at, data_snapshot)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    f"{entity.id}:{new_version}",
-                    entity.id,
-                    new_version,
-                    "update",
-                    now.isoformat(),
-                    json.dumps(updated_entity.to_dict()),
-                ),
+                self._adapter.execute(
+                    conn, sql,
+                    (
+                        entity.id, entity.type, entity.status, entity.title,
+                        json.dumps(entity.data), 1,
+                        entity.created_at.isoformat(), entity.updated_at.isoformat()
+                    )
+                )
+                # Log version create
+                self._log_version(conn, entity.id, 1, 'create', entity.data)
+
+        return entity
+
+    def get(self, id: str) -> Optional[Entity]:
+        """Retrieve an entity by ID."""
+        p = self._adapter.param
+        with self._adapter.connection() as conn:
+            cursor = self._adapter.execute(
+                conn,
+                f"SELECT * FROM entities WHERE id = {p}",
+                (id,)
             )
+            row = self._adapter.fetchone(cursor)
+            if row:
+                return self._row_to_entity(row)
+        return None
 
-        return updated_entity
-
-    def delete(self, entity_id: str) -> bool:
+    def delete(self, id: str) -> bool:
         """
-        Delete an entity by ID.
+        Delete an entity.
 
-        Args:
-            entity_id: Entity ID to delete
-
-        Returns:
-            True if deleted, False if not found
+        Returns True if entity was deleted, False if not found.
         """
-        with self._connection() as conn:
-            # Get full entity before delete (for version tracking snapshot)
-            row = conn.execute(
-                "SELECT * FROM entities WHERE id = ?",
-                (entity_id,)
-            ).fetchone()
+        p = self._adapter.param
+        with self._adapter.connection() as conn:
+            # Get current state for version tracking
+            cursor = self._adapter.execute(
+                conn,
+                f"SELECT version, data FROM entities WHERE id = {p}",
+                (id,)
+            )
+            existing = self._adapter.fetchone(cursor)
 
-            if row is None:
+            if not existing:
                 return False
 
-            version = row["version"]
-
-            # Create snapshot for sync/audit purposes
-            entity_snapshot = {
-                "id": row["id"],
-                "type": row["type"],
-                "status": row["status"],
-                "data": json.loads(row["data"]),
-                "version": version,
-                "created_at": row["created_at"],
-                "updated_at": row["updated_at"],
-            }
-
-            # Record deletion for sync BEFORE delete
-            conn.execute(
-                """
-                INSERT INTO entity_versions (id, entity_id, version, change_type, changed_at, data_snapshot)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    f"{entity_id}:{version + 1}",
-                    entity_id,
-                    version + 1,
-                    "delete",
-                    datetime.utcnow().isoformat(),
-                    json.dumps(entity_snapshot),
-                ),
+            # Delete entity
+            cursor = self._adapter.execute(
+                conn,
+                f"DELETE FROM entities WHERE id = {p}",
+                (id,)
             )
 
-            # Now delete the entity
-            result = conn.execute(
-                "DELETE FROM entities WHERE id = ?",
-                (entity_id,)
-            )
+            # Log version delete
+            data = json.loads(existing['data']) if isinstance(existing['data'], str) else existing['data']
+            self._log_version(conn, id, existing['version'], 'delete', data)
 
-            return result.rowcount > 0
+            return self._adapter.rowcount(cursor) > 0
 
     def list(
         self,
-        entity_type: Optional[str] = None,
+        type: Optional[str] = None,
         status: Optional[str] = None,
         limit: int = 100,
-        offset: int = 0,
     ) -> List[Entity]:
-        """
-        List entities with optional filters.
-
-        Args:
-            entity_type: Filter by type (e.g., "feature")
-            status: Filter by status (e.g., "in_progress")
-            limit: Maximum entities to return
-            offset: Number of entities to skip
-
-        Returns:
-            List of matching entities
-        """
+        """List entities with optional filters."""
+        p = self._adapter.param
         query = "SELECT * FROM entities WHERE 1=1"
         params = []
 
-        if entity_type:
-            query += " AND type = ?"
-            params.append(entity_type)
-
+        if type:
+            query += f" AND type = {p}"
+            params.append(type)
         if status:
-            query += " AND status = ?"
+            query += f" AND status = {p}"
             params.append(status)
 
-        query += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
+        query += f" ORDER BY updated_at DESC LIMIT {p}"
+        params.append(limit)
 
-        with self._connection() as conn:
-            rows = conn.execute(query, params).fetchall()
-            return [self._row_to_entity(row) for row in rows]
+        with self._adapter.connection() as conn:
+            cursor = self._adapter.execute(conn, query, tuple(params))
+            rows = self._adapter.fetchall(cursor)
+            return [self._row_to_entity(r) for r in rows]
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # GRAPH OPERATIONS (Tensegrity Physics)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def get_bonds_from(self, id: str) -> List[Entity]:
+        """Get downstream bonds (Forces emanating from this Entity)."""
+        p = self._adapter.param
+        with self._adapter.connection() as conn:
+            cursor = self._adapter.execute(
+                conn,
+                f"SELECT * FROM entities WHERE type = 'relationship' AND rel_from = {p}",
+                (id,)
+            )
+            rows = self._adapter.fetchall(cursor)
+            return [self._row_to_entity(r) for r in rows]
+
+    def get_bonds_to(self, id: str) -> List[Entity]:
+        """Get upstream bonds (Forces acting upon this Entity)."""
+        p = self._adapter.param
+        with self._adapter.connection() as conn:
+            cursor = self._adapter.execute(
+                conn,
+                f"SELECT * FROM entities WHERE type = 'relationship' AND rel_to = {p}",
+                (id,)
+            )
+            rows = self._adapter.fetchall(cursor)
+            return [self._row_to_entity(r) for r in rows]
+
+    def count(self, type: Optional[str] = None) -> int:
+        """Count entities, optionally by type."""
+        p = self._adapter.param
+        query = "SELECT COUNT(*) as cnt FROM entities"
+        params = []
+
+        if type:
+            query += f" WHERE type = {p}"
+            params.append(type)
+
+        with self._adapter.connection() as conn:
+            cursor = self._adapter.execute(conn, query, tuple(params))
+            row = self._adapter.fetchone(cursor)
+            return row['cnt'] if row else 0
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SEARCH (FTS)
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def search(self, query: str, limit: int = 20) -> List[Entity]:
         """
         Full-text search across entities.
 
-        Args:
-            query: Search query
-            limit: Maximum results
-
-        Returns:
-            List of matching entities
+        Uses FTS5 (SQLite) or tsvector (PostgreSQL) depending on backend.
         """
-        # Escape query for FTS: hyphens are interpreted as column operators
-        # Quote the entire query to treat it as a phrase/literal
-        # Also escape any internal quotes
-        escaped_query = '"' + query.replace('"', '""') + '"'
+        if not self._adapter.supports_fts:
+            # Fallback to LIKE search
+            return self._search_like(query, limit)
 
-        with self._connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT e.* FROM entities e
-                JOIN entities_fts fts ON e.rowid = fts.rowid
-                WHERE entities_fts MATCH ?
-                ORDER BY rank
-                LIMIT ?
-                """,
-                (escaped_query, limit),
-            ).fetchall()
-            return [self._row_to_entity(row) for row in rows]
+        sql, params = self._adapter.fts_search_sql(query, limit)
 
-    def get_changes_since(self, since_version: int) -> List[Tuple[Entity, str]]:
+        with self._adapter.connection() as conn:
+            cursor = self._adapter.execute(conn, sql, params)
+            rows = self._adapter.fetchall(cursor)
+            return [self._row_to_entity(r) for r in rows]
+
+    def _search_like(self, query: str, limit: int) -> List[Entity]:
+        """Fallback LIKE search when FTS is not available."""
+        p = self._adapter.param
+        pattern = f"%{query}%"
+        sql = f"""
+            SELECT * FROM entities
+            WHERE title LIKE {p}
+               OR {self._adapter.json_extract('data', 'description')} LIKE {p}
+            LIMIT {p}
         """
-        Get entity changes since a version (for sync).
+        with self._adapter.connection() as conn:
+            cursor = self._adapter.execute(conn, sql, (pattern, pattern, limit))
+            rows = self._adapter.fetchall(cursor)
+            return [self._row_to_entity(r) for r in rows]
 
-        Args:
-            since_version: Get changes after this version
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TRAJECTORY OPERATIONS (Narrative Arc)
+    # ═══════════════════════════════════════════════════════════════════════════
 
-        Returns:
-            List of (entity, change_type) tuples
+    def get_focus_chain(self, focus_id: str, limit: int = 10) -> List[Entity]:
         """
-        with self._connection() as conn:
-            # Query version records directly - all changes have data_snapshot
-            rows = conn.execute(
-                """
-                SELECT * FROM entity_versions
-                WHERE CAST(SUBSTR(id, INSTR(id, ':') + 1) AS INTEGER) > ?
-                ORDER BY changed_at
-                """,
-                (since_version,),
-            ).fetchall()
+        Traverse the narrative arc (Trajectory).
+        Follows 'relates-to' bonds upstream to find the history of this focus.
+        """
+        p = self._adapter.param
+        # Recursive CTE works in both SQLite and PostgreSQL
+        query = f"""
+        WITH RECURSIVE chain AS (
+            -- Start with the current focus
+            SELECT id, type, status, title, data, created_at, updated_at, 0 as depth
+            FROM entities WHERE id = {p}
 
-            results = []
-            for row in rows:
-                change_type = row["change_type"]
-                data_snapshot = row["data_snapshot"]
+            UNION ALL
 
-                if not data_snapshot:
-                    # Skip records without snapshots (shouldn't happen)
-                    continue
-
-                entity = Entity.from_dict(json.loads(data_snapshot))
-                results.append((entity, change_type))
-
-            return results
-
-    def _row_to_entity(self, row: sqlite3.Row) -> Entity:
-        """Convert database row to Entity."""
-        return Entity(
-            id=row["id"],
-            type=row["type"],
-            status=row["status"],
-            data=json.loads(row["data"]),
-            version=row["version"],
-            created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
+            -- Follow 'relates-to' bonds from current to previous
+            SELECT e.id, e.type, e.status, e.title, e.data, e.created_at, e.updated_at, c.depth + 1
+            FROM entities e
+            JOIN entities r ON r.type = 'relationship'
+                AND r.rel_type = 'relates-to'
+                AND r.rel_to = e.id
+            JOIN chain c ON r.rel_from = c.id
+            WHERE e.type = 'focus' AND c.depth < {p}
         )
+        SELECT * FROM chain ORDER BY depth ASC;
+        """
+        with self._adapter.connection() as conn:
+            cursor = self._adapter.execute(conn, query, (focus_id, limit))
+            rows = self._adapter.fetchall(cursor)
+            return [self._row_to_entity(r) for r in rows]
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # VERSION TRACKING
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _log_version(
+        self,
+        conn: Any,
+        entity_id: str,
+        version: int,
+        change_type: str,
+        data: dict,
+    ):
+        """Log a version change for an entity."""
+        p = self._adapter.param
+        now = datetime.now(timezone.utc).isoformat()
+        sql = f"""
+            INSERT INTO entity_versions (id, entity_id, version, change_type, changed_at, data_snapshot)
+            VALUES ({p}, {p}, {p}, {p}, {p}, {p})
+        """
+        self._adapter.execute(
+            conn, sql,
+            (str(uuid.uuid4()), entity_id, version, change_type, now, json.dumps(data))
+        )
+
+    def get_versions(self, entity_id: str, limit: int = 10) -> List[dict]:
+        """Get version history for an entity."""
+        p = self._adapter.param
+        sql = f"""
+            SELECT * FROM entity_versions
+            WHERE entity_id = {p}
+            ORDER BY changed_at DESC
+            LIMIT {p}
+        """
+        with self._adapter.connection() as conn:
+            cursor = self._adapter.execute(conn, sql, (entity_id, limit))
+            rows = self._adapter.fetchall(cursor)
+            return [dict(r) for r in rows]
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # HISTORY OPERATIONS (Memory of Action)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def log_trace(
+        self,
+        tool: str,
+        inputs: Any,
+        outputs: Any = None,
+        error: Optional[str] = None,
+    ):
+        """Record an action in history. The system remembers what it did."""
+        p = self._adapter.param
+        now = datetime.now(timezone.utc).isoformat()
+        with self._adapter.connection() as conn:
+            self._adapter.execute(
+                conn,
+                f"""INSERT INTO traces (id, tool, inputs, outputs, error, created_at)
+                    VALUES ({p}, {p}, {p}, {p}, {p}, {p})""",
+                (
+                    str(uuid.uuid4()),
+                    tool,
+                    json.dumps(inputs) if inputs else None,
+                    json.dumps(outputs) if outputs else None,
+                    error,
+                    now,
+                )
+            )
+
+    def get_traces(self, tool: Optional[str] = None, limit: int = 100) -> List[dict]:
+        """Retrieve action history."""
+        p = self._adapter.param
+        query = "SELECT * FROM traces WHERE 1=1"
+        params = []
+
+        if tool:
+            query += f" AND tool = {p}"
+            params.append(tool)
+
+        query += f" ORDER BY created_at DESC LIMIT {p}"
+        params.append(limit)
+
+        with self._adapter.connection() as conn:
+            cursor = self._adapter.execute(conn, query, tuple(params))
+            rows = self._adapter.fetchall(cursor)
+            return [dict(r) for r in rows]
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # HELPERS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _row_to_entity(self, row: dict) -> Entity:
+        """Convert database row to Entity."""
+        data = row['data']
+        if isinstance(data, str):
+            data = json.loads(data)
+
+        created_at = row['created_at']
+        if isinstance(created_at, str):
+            created_at = datetime.fromisoformat(created_at)
+
+        updated_at = row['updated_at']
+        if isinstance(updated_at, str):
+            updated_at = datetime.fromisoformat(updated_at)
+
+        return Entity(
+            id=row['id'],
+            type=row['type'],
+            status=row['status'],
+            title=row['title'],
+            data=data,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+
+    def close(self):
+        """Close adapter connections."""
+        self._adapter.close()

@@ -1,0 +1,66 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-sqlite:
+    name: Test SQLite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[test]"
+
+      - name: Run tests (SQLite)
+        run: |
+          pytest tests/ -v --ignore=tests/bdd
+
+  # PostgreSQL testing on PRs is handled by neon-branch.yml (uses Neon branch per PR)
+  # This job runs on main push only, using a local container for verification
+  test-postgres-main:
+    name: Test PostgreSQL (main only)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: chora_test
+          POSTGRES_PASSWORD: chora_test
+          POSTGRES_DB: chora_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[test,postgres]"
+
+      - name: Run parity tests (PostgreSQL)
+        env:
+          CHORA_TEST_POSTGRES_DSN: postgresql://chora_test:chora_test@localhost:5432/chora_test
+        run: |
+          pytest tests/test_backend_parity.py tests/test_physics_triggers.py -v

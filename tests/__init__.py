@@ -1,1 +1,0 @@
-# chora-store tests
