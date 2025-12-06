@@ -18,11 +18,17 @@ def main():
     tool = sys.argv[1]
     args = sys.argv[2:]
 
+    # FastMCP 2.x wraps tools as FunctionTool objects; access underlying fn via .fn
+    _manifest = manifest.fn if hasattr(manifest, 'fn') else manifest
+    _bond = bond.fn if hasattr(bond, 'fn') else bond
+    _transmute = transmute.fn if hasattr(transmute, 'fn') else transmute
+    _sense = sense.fn if hasattr(sense, 'fn') else sense
+
     try:
         if tool == "sense":
             query = args[0] if len(args) > 0 else "orient"
             target = args[1] if len(args) > 1 else None
-            print(sense(query, target))
+            print(_sense(query, target))
 
         elif tool == "manifest":
             if len(args) < 2:
@@ -31,20 +37,20 @@ def main():
             type_ = args[0]
             title = args[1]
             data = args[2] if len(args) > 2 else "{}"
-            print(manifest(type_, title, data))
+            print(_manifest(type_, title, data))
 
         elif tool == "bond":
             if len(args) < 3:
                 print("Error: bond requires <verb> <from_id> <to_id>")
                 sys.exit(1)
-            print(bond(args[0], args[1], args[2]))
+            print(_bond(args[0], args[1], args[2]))
 
         elif tool == "transmute":
             if len(args) < 2:
                 print("Error: transmute requires <id> <operation>")
                 sys.exit(1)
             params = args[2] if len(args) > 2 else "{}"
-            print(transmute(args[0], args[1], params))
+            print(_transmute(args[0], args[1], params))
 
         else:
             print(f"Unknown tool: {tool}")

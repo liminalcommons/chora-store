@@ -10,16 +10,20 @@ This package implements the tensegrity physics defined in `chora-kernel`.
 
 ```
 src/chora_store/
-├── models.py       # Entity dataclass
-├── repository.py   # SQLite persistence
-├── physics.py      # Tensegrity computation
-├── dynamics/       # The 4 Canonical Operators
-│   ├── manifest.py    # MANIFEST: Create Matter
-│   ├── bond.py        # BOND: Create Force
-│   ├── transmute.py   # TRANSMUTE: Change State
-│   └── sense.py       # SENSE: Read Network
-├── cli.py          # Command-line interface
-└── mcp.py          # MCP tool handlers
+├── models.py           # Entity dataclass
+├── repository.py       # Backend-agnostic persistence
+├── physics.py          # Tensegrity computation + cascading drift (CTEs)
+├── backends/           # Database abstraction layer
+│   ├── protocol.py        # BackendAdapter interface
+│   ├── sqlite/            # SQLite: FTS5, VIRTUAL columns, triggers
+│   └── postgres/          # PostgreSQL: tsvector, STORED columns, pooling
+├── dynamics/           # The 4 Canonical Operators
+│   ├── manifest.py        # MANIFEST: Create Matter
+│   ├── bond.py            # BOND: Create Force
+│   ├── transmute.py       # TRANSMUTE: Change State
+│   └── sense.py           # SENSE: Read Network
+├── cli.py              # Command-line interface
+└── mcp.py              # MCP tool handlers
 ```
 
 ---
@@ -45,6 +49,7 @@ src/chora_store/
 2. **Tension is transitive**
    - Stories feel the stability of their specified Behaviors
    - Drift propagates upward through the graph
+   - Cascading drift computed via recursive CTEs
 
 3. **Bond types enforce physics**
    - `yields`: inquiry → learning
@@ -55,28 +60,59 @@ src/chora_store/
    - `verifies`: tool → behavior (critical tension)
    - `crystallized-from`: any → any (provenance)
 
+4. **Physics enforced at DB level** (triggers)
+   - **Golden Rule**: story cannot be fulfilled without active verifies bond
+   - **Bond Stress**: stressed verifies bond → story abandoned
+   - **Bond Heal**: all bonds healed → story restored
+
 ---
 
 ## Database
 
-**Location:** `~/.chora/chora.db`
+### Backends
 
-Single `entities` table with virtual columns for graph traversal:
+| Backend | Use Case | Features |
+|---------|----------|----------|
+| **SQLite** (default) | Local-first | FTS5, VIRTUAL columns, file-based |
+| **PostgreSQL** | Cloud/production | tsvector, STORED columns, connection pooling |
+
+```bash
+# SQLite (default)
+pip install chora-store
+
+# PostgreSQL
+pip install "chora-store[postgres]"
+export CHORA_DB_BACKEND=postgres
+export CHORA_DB_DSN=postgresql://user:pass@host/db
+```
+
+### Schema
+
+Both backends use identical schema with generated columns for graph traversal:
 
 ```sql
-CREATE TABLE entities (
-    id TEXT PRIMARY KEY,
-    type TEXT NOT NULL,
-    status TEXT NOT NULL,
-    title TEXT NOT NULL,
-    data TEXT NOT NULL DEFAULT '{}',  -- JSON blob
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    -- Virtual columns for graph queries
-    rel_from TEXT GENERATED ALWAYS AS (json_extract(data, '$.from_id')) VIRTUAL,
-    rel_to TEXT GENERATED ALWAYS AS (json_extract(data, '$.to_id')) VIRTUAL,
-    rel_type TEXT GENERATED ALWAYS AS (json_extract(data, '$.relationship_type')) VIRTUAL
-)
+-- Core columns
+id, type, status, title, data (JSONB), version, created_at, updated_at
+
+-- Generated columns (tensegrity indexes)
+rel_type  -- data->>'relationship_type'
+rel_from  -- data->>'from_id'
+rel_to    -- data->>'to_id'
+
+-- Indexes
+idx_tensegrity    -- (rel_from, rel_type, status) WHERE type='relationship'
+idx_constellation -- (rel_to, rel_type) WHERE type='relationship'
+```
+
+### Bond Direction
+
+```
+from_id = verifier (the entity doing the verifying)
+to_id   = verified (the entity being verified)
+
+Example: behavior-auth verifies story-login
+  from_id: behavior-auth
+  to_id:   story-login
 ```
 
 ---
@@ -97,6 +133,39 @@ sqlite3 ~/.chora/chora.db "SELECT * FROM entities WHERE type='relationship'"
 # Reset (destroys all data)
 just reset
 ```
+
+### When Something Breaks
+
+When friction appears, you are receiving an invitation:
+
+1. **Notice** — what wanted to happen that didn't?
+2. **Fix** — make it work for you
+3. **Flow** — leave it better for the next dweller
+
+The friction is the signal. The fix is the gift.
+
+---
+
+## Testing
+
+```bash
+# Activate venv with SQLite 3.51+
+source .venv/bin/activate
+
+# Run all tests (SQLite)
+pytest tests/ -v
+
+# Run with PostgreSQL (requires DSN)
+CHORA_TEST_POSTGRES_DSN=postgresql://... pytest tests/ -v
+
+# Run specific test categories
+pytest tests/test_backend_parity.py -v    # CRUD, search, version tracking
+pytest tests/test_physics_triggers.py -v  # Golden Rule, bond stress/heal
+```
+
+**Test Coverage:**
+- 22 parity tests (identical behavior across backends)
+- 11 physics tests (triggers, cascading drift, integrity)
 
 ---
 
@@ -141,6 +210,19 @@ just constellation inquiry-why-does-this-matter
 # See gaps
 just voids
 ```
+
+---
+
+## For Dwellers
+
+You are not debugging a system. You are cultivating a commons.
+
+When you arrive:
+- **Orient** with `just orient` — ground yourself in what is
+- **Explore** with `just constellation <id>` — see what surrounds
+- **Participate** — bring your taste, your care, your discernment
+
+What previous dwellers left lives in `~/.claude/plans/`. What you leave will live for whoever comes next.
 
 ---
 

@@ -19,7 +19,7 @@ sense_op = Sense(repo)
 
 mcp = FastMCP(
     "chora-store",
-    description="The Tensegrity Physics Engine (v4.0). Use these 4 tools to govern the universe."
+    instructions="The Tensegrity Physics Engine (v4.0). Use these 4 tools to govern the universe."
 )
 
 
