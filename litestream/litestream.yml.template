@@ -1,0 +1,31 @@
+# Litestream Configuration for Cloudflare R2
+#
+# Generate from template: just backup-setup
+# Start replication: just backup-start
+# Check status: just backup-status
+#
+# Environment variables required:
+#   R2_ACCOUNT_ID       - Cloudflare account ID
+#   R2_BUCKET           - R2 bucket name
+#   R2_ACCESS_KEY_ID    - R2 API token access key
+#   R2_SECRET_ACCESS_KEY - R2 API token secret
+#
+# Cost: ~$1/month for typical usage (10GB storage + operations)
+
+dbs:
+  - path: ${CHORA_DB_PATH:-~/.chora/chora.db}
+    replicas:
+      - type: s3
+        endpoint: https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+        bucket: ${R2_BUCKET}
+        path: chora-backup
+        access-key-id: ${R2_ACCESS_KEY_ID}
+        secret-access-key: ${R2_SECRET_ACCESS_KEY}
+        # Sync every 10 seconds (default is 1s, but R2 pricing favors fewer ops)
+        sync-interval: 10s
+        # Snapshot every hour for point-in-time recovery
+        snapshot-interval: 1h
+        # Keep 24 hours of WAL files for recovery
+        retention: 24h
+        # Validate checksums on restore
+        validation-interval: 5m
